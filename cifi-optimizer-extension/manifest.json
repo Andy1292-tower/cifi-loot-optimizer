@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "CIFI Tools \u2014 Loot Score Optimizer",
+  "version": "1.1.5",
+  "description": "Auto-optimize hunter builds for maximum Loot Score on cifi-tools.com. Adds a Optimize button.",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://cifi-tools.com/*",
+        "http://127.0.0.1/*",
+        "http://localhost/*"
+      ],
+      "js": [
+        "optimizer.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+# Track only the extension and repo metadata; ignore everything else here.
+/*
+
+!/.gitignore
+!/README.md
+!/cifi-optimizer-extension/
+
+.DS_Store
