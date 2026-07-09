@@ -13,7 +13,7 @@
   'use strict';
   if (window.__cifiOptimizerLoaded) return;
   window.__cifiOptimizerLoaded = true;
-  console.log('%c[CIFI Optimizer v1.2.0] loaded (Stop button; unlimited-time now converges and terminates) — waiting for app…', 'color:#8b5cf6;font-weight:bold');
+  console.log('%c[CIFI Optimizer v1.3.0] loaded (3 modes: Balanced, Thorough, Exploratory) — waiting for app…', 'color:#8b5cf6;font-weight:bold');
 
   // Worker URL is discovered at runtime (the deployed asset hash can change).
   let WORKER_URL = null;
@@ -359,44 +359,112 @@
     const timeMs = opts.timeMs || 90000;
     const patience = opts.patience == null ? 4 : opts.patience;
     const t0 = performance.now();
-    let cur = { tv: best.tv.slice(), av: best.av.slice(), score: best.score };
-    // Convergence is tracked against the GLOBAL best, counting whole restart cycles
-    // (climb → stall → perturb) that fail to beat it. After `patience` fruitless
-    // restarts the run always terminates — so "unlimited time" = run to convergence,
-    // never an infinite loop.
-    let failedRestarts = 0, improvedBestSincePerturb = false;
     const timeLeft = () => performance.now() - t0 < timeMs;
     const stopped = () => !!(opts.shouldStop && opts.shouldStop());
-    while (timeLeft() && failedRestarts <= patience && !stopped()) {
+    const progress = () => onProgress && onProgress({ phase: 'search', score: best.score, evals, elapsed: (performance.now() - t0) / 1000 });
+
+    // Evaluate the full legal neighbourhood of (tv,av) in parallel batches and
+    // return the single best improving move (or null). Shared by Thorough mode and
+    // the Exploratory polish.
+    async function steepestPass(tv, av, curScore) {
       const cands = [];
-      for (const m of talentMoves(cur.tv)) cands.push({ k: 't', m });
-      for (const m of attrMoves(cur.av)) cands.push({ k: 'a', m });
-      if (!cands.length) break;
-      for (let i = cands.length - 1; i > 0; i--) { const j = rand(i + 1); const t = cands[i]; cands[i] = cands[j]; cands[j] = t; }
-      const capPerWave = Math.min(cands.length, Math.max(POOL_N * 4, 24));
-      let improved = null;
-      for (let i = 0; i < capPerWave && !improved && timeLeft() && !stopped();) {
+      for (const m of talentMoves(tv)) cands.push({ k: 't', m });
+      for (const m of attrMoves(av)) cands.push({ k: 'a', m });
+      if (!cands.length) return null;
+      let bestMove = null;
+      for (let i = 0; i < cands.length && timeLeft() && !stopped();) {
         const batch = cands.slice(i, i + POOL_N); i += batch.length;
         const scored = await Promise.all(batch.map(async c => ({
-          c, s: c.k === 't' ? await evalVec(c.m, cur.av) : await evalVec(cur.tv, c.m),
+          c, s: c.k === 't' ? await evalVec(c.m, av) : await evalVec(tv, c.m),
         })));
         evals += batch.length;
-        for (const r of scored) if (r.s > cur.score * MARGIN && (!improved || r.s > improved.s)) improved = r;
-        onProgress && onProgress({ phase: 'search', score: best.score, evals, elapsed: (performance.now() - t0) / 1000 });
+        for (const r of scored) if (r.s > curScore * MARGIN && (!bestMove || r.s > bestMove.s)) bestMove = r;
+        progress();
       }
-      if (improved) {
-        cur = improved.c.k === 't'
-          ? { tv: improved.c.m, av: cur.av, score: improved.s }
-          : { tv: cur.tv, av: improved.c.m, score: improved.s };
-        if (cur.score > best.score) { best = { tv: cur.tv.slice(), av: cur.av.slice(), score: cur.score }; improvedBestSincePerturb = true; }
-      } else {
-        // Reached a local optimum (end of a climb). Count the restart cycle.
-        if (improvedBestSincePerturb) failedRestarts = 0; else failedRestarts++;
-        improvedBestSincePerturb = false;
-        cur = { tv: best.tv.slice(), av: best.av.slice(), score: best.score };
-        for (let k = 0; k < 3; k++) { const tm = talentMoves(cur.tv); if (tm.length) cur.tv = tm[rand(tm.length)]; }
-        for (let k = 0; k < 3; k++) { const am = attrMoves(cur.av); if (am.length) cur.av = am[rand(am.length)]; }
-        cur.score = await evalVec(cur.tv, cur.av); evals++;
+      if (!bestMove) return null;
+      return bestMove.c.k === 't' ? { tv: bestMove.c.m, av, score: bestMove.s } : { tv, av: bestMove.c.m, score: bestMove.s };
+    }
+
+    const mode = opts.mode || 'balanced';
+
+    if (mode === 'thorough') {
+      // Deterministic steepest descent: take the single best legal move each pass
+      // until a full neighbourhood scan finds no improvement.
+      let st = { tv: best.tv.slice(), av: best.av.slice(), score: best.score };
+      while (timeLeft() && !stopped()) {
+        const nx = await steepestPass(st.tv, st.av, st.score);
+        if (!nx) break;
+        st = nx;
+        if (st.score > best.score) best = { tv: st.tv.slice(), av: st.av.slice(), score: st.score };
+      }
+    } else if (mode === 'exploratory') {
+      // Simulated annealing over random single moves; occasionally accepts a worse
+      // build with probability exp(Δrel / T), T cooling to 0 (Heat = initial T).
+      // Sims are floored high upstream so accept/reject isn't chasing MC noise.
+      const samples = Math.max(50, opts.samples || 400);
+      const heat0 = Math.max(0, opts.heat == null ? 50 : opts.heat) / 100 * 0.05; // initial relative temperature
+      let curT = { tv: best.tv.slice(), av: best.av.slice(), score: best.score };
+      for (let step = 0; step < samples && timeLeft() && !stopped(); step++) {
+        const T = heat0 * (1 - step / samples);
+        const useTalent = Math.random() < 0.5;
+        const moves = useTalent ? talentMoves(curT.tv) : attrMoves(curT.av);
+        if (!moves.length) continue;
+        const m = moves[rand(moves.length)];
+        const nt = useTalent ? m : curT.tv, na = useTalent ? curT.av : m;
+        const sc = await evalVec(nt, na); evals++;
+        const dRel = curT.score > 0 ? (sc - curT.score) / curT.score : (sc - curT.score);
+        if (dRel >= 0 || (T > 0 && Math.random() < Math.exp(dRel / T))) {
+          curT = { tv: nt, av: na, score: sc };
+          if (sc > best.score) best = { tv: curT.tv.slice(), av: curT.av.slice(), score: sc };
+        }
+        if (step % 4 === 0) progress();
+      }
+      // Greedy polish from the best basin the annealing landed in.
+      let st = { tv: best.tv.slice(), av: best.av.slice(), score: best.score };
+      for (let p = 0; p < 5 && timeLeft() && !stopped(); p++) {
+        const nx = await steepestPass(st.tv, st.av, st.score);
+        if (!nx) break;
+        st = nx;
+        if (st.score > best.score) best = { tv: st.tv.slice(), av: st.av.slice(), score: st.score };
+      }
+    } else {
+      // Balanced (default): pool-saturating stochastic hill-climb with perturbation
+      // restarts. Termination is tracked against the GLOBAL best, counting whole
+      // restart cycles (climb → stall → perturb) that fail to beat it — so after
+      // `patience` fruitless restarts it always terminates (unlimited time = run to
+      // convergence, never an infinite loop).
+      let cur = { tv: best.tv.slice(), av: best.av.slice(), score: best.score };
+      let failedRestarts = 0, improvedBestSincePerturb = false;
+      while (timeLeft() && failedRestarts <= patience && !stopped()) {
+        const cands = [];
+        for (const m of talentMoves(cur.tv)) cands.push({ k: 't', m });
+        for (const m of attrMoves(cur.av)) cands.push({ k: 'a', m });
+        if (!cands.length) break;
+        for (let i = cands.length - 1; i > 0; i--) { const j = rand(i + 1); const t = cands[i]; cands[i] = cands[j]; cands[j] = t; }
+        const capPerWave = Math.min(cands.length, Math.max(POOL_N * 4, 24));
+        let improved = null;
+        for (let i = 0; i < capPerWave && !improved && timeLeft() && !stopped();) {
+          const batch = cands.slice(i, i + POOL_N); i += batch.length;
+          const scored = await Promise.all(batch.map(async c => ({
+            c, s: c.k === 't' ? await evalVec(c.m, cur.av) : await evalVec(cur.tv, c.m),
+          })));
+          evals += batch.length;
+          for (const r of scored) if (r.s > cur.score * MARGIN && (!improved || r.s > improved.s)) improved = r;
+          progress();
+        }
+        if (improved) {
+          cur = improved.c.k === 't'
+            ? { tv: improved.c.m, av: cur.av, score: improved.s }
+            : { tv: cur.tv, av: improved.c.m, score: improved.s };
+          if (cur.score > best.score) { best = { tv: cur.tv.slice(), av: cur.av.slice(), score: cur.score }; improvedBestSincePerturb = true; }
+        } else {
+          if (improvedBestSincePerturb) failedRestarts = 0; else failedRestarts++;
+          improvedBestSincePerturb = false;
+          cur = { tv: best.tv.slice(), av: best.av.slice(), score: best.score };
+          for (let k = 0; k < 3; k++) { const tm = talentMoves(cur.tv); if (tm.length) cur.tv = tm[rand(tm.length)]; }
+          for (let k = 0; k < 3; k++) { const am = attrMoves(cur.av); if (am.length) cur.av = am[rand(am.length)]; }
+          cur.score = await evalVec(cur.tv, cur.av); evals++;
+        }
       }
     }
 
@@ -482,9 +550,12 @@
           <label class="cifi-field">Hunter<select id="cifi-hunter">${hunterIds.map(h=>`<option value="${h}">${h[0].toUpperCase()+h.slice(1)}</option>`).join('')}</select></label>
           <label class="cifi-field">Build<select id="cifi-build" style="min-width:220px"></select></label>
           <label class="cifi-field" style="flex-direction:row;align-items:center;gap:6px;padding-bottom:9px"><input type="checkbox" id="cifi-hidearch" checked style="min-width:0">Hide archived</label>
+          <label class="cifi-field">Mode<select id="cifi-mode" style="min-width:130px"><option value="balanced">Balanced</option><option value="thorough">Thorough</option><option value="exploratory">Exploratory</option></select></label>
           <label class="cifi-field">Search iters<input id="cifi-si" type="number" value="1200" min="200" step="100" style="width:90px"></label>
           <label class="cifi-field">Final iters<input id="cifi-fi" type="number" value="10000" min="1000" step="1000" style="width:90px"></label>
           <label class="cifi-field">Max time (s, 0=∞)<input id="cifi-tm" type="number" value="75" min="0" step="15" style="width:80px"></label>
+          <label class="cifi-field cifi-explor" style="display:none">Heat<input id="cifi-heat" type="number" value="50" min="0" max="100" step="5" style="width:70px"></label>
+          <label class="cifi-field cifi-explor" style="display:none">Samples<input id="cifi-samples" type="number" value="400" min="50" step="50" style="width:80px"></label>
           <button class="cifi-btn" id="cifi-run">Optimize</button>
         </div>
         <div id="cifi-status" class="cifi-muted">Redistributes this build's talent &amp; attribute points for maximum Loot Score. Current build stays feasible, so it can only match or beat it.</div>
@@ -528,10 +599,22 @@
     }
     $('#cifi-hunter').onchange = fillBuilds;
     $('#cifi-hidearch').onchange = fillBuilds;
+    const MODE_DESC = {
+      balanced: 'Balanced — fast stochastic search: climbs from the best, restarts when stuck. Good default for most builds.',
+      thorough: 'Thorough — deterministic steepest descent: tries every legal move each pass until nothing improves. Best for squeezing a solid build.',
+      exploratory: 'Exploratory — simulated annealing: sometimes accepts worse builds early (Heat) to escape stuck results. Sims are raised for stable decisions.',
+    };
+    function applyMode() {
+      const m = $('#cifi-mode').value;
+      wrap.querySelectorAll('.cifi-explor').forEach(el => { el.style.display = m === 'exploratory' ? '' : 'none'; });
+      $('#cifi-status').textContent = MODE_DESC[m] || '';
+    }
+    $('#cifi-mode').onchange = applyMode;
     // Default to whichever hunter page is currently open.
     const curHunter = (location.pathname.match(/\/(borge|ozzy|knox)(?:\/|$)/) || [])[1];
     if (curHunter && hunterIds.includes(curHunter)) $('#cifi-hunter').value = curHunter;
     fillBuilds();
+    applyMode();
 
     const runBtn = $('#cifi-run');
     async function startRun() {
@@ -539,10 +622,15 @@
       const list = $('#cifi-build').__list || buildsFor(h);
       const build = list[+$('#cifi-build').value];
       if (!build) return;
-      const searchIters = Math.max(200, +$('#cifi-si').value || 1200);
+      const mode = $('#cifi-mode').value || 'balanced';
+      let searchIters = Math.max(200, +$('#cifi-si').value || 1200);
       const finalIters = Math.max(1000, +$('#cifi-fi').value || 10000);
       const tmSec = Math.max(0, +$('#cifi-tm').value || 0);
       const timeMs = tmSec > 0 ? tmSec * 1000 : Infinity; // 0 = unlimited (run to convergence)
+      const heat = Math.max(0, Math.min(100, +$('#cifi-heat').value || 50));
+      const samples = Math.max(50, +$('#cifi-samples').value || 400);
+      // Exploratory's accept/reject is noise-sensitive, so floor the sim count.
+      if (mode === 'exploratory') searchIters = Math.max(searchIters, 3000);
       let stopFlag = false;
       $('#cifi-out').innerHTML = '';
       $('#cifi-status').textContent = 'Warming up engine…';
@@ -558,6 +646,7 @@
         const res = await optimize(h, build, {
           pool: await ensurePool(), ctx, searchIters, finalIters, timeMs,
           margin: 0.0005, patience: 4, shouldStop: () => stopFlag,
+          mode, heat, samples,
         }, (p) => {
           const pct = Math.min(98, (p.evals / Math.max(1, (p.evals + 40))) * 100);
           $('#cifi-bar').style.width = pct + '%';
