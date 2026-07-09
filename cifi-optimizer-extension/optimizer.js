@@ -13,7 +13,7 @@
   'use strict';
   if (window.__cifiOptimizerLoaded) return;
   window.__cifiOptimizerLoaded = true;
-  console.log('%c[CIFI Optimizer v1.1.5] loaded (retries stalled evals; timeout scales with iters; 0=unlimited time) — waiting for app…', 'color:#8b5cf6;font-weight:bold');
+  console.log('%c[CIFI Optimizer v1.2.0] loaded (Stop button; unlimited-time now converges and terminates) — waiting for app…', 'color:#8b5cf6;font-weight:bold');
 
   // Worker URL is discovered at runtime (the deployed asset hash can change).
   let WORKER_URL = null;
@@ -360,9 +360,14 @@
     const patience = opts.patience == null ? 4 : opts.patience;
     const t0 = performance.now();
     let cur = { tv: best.tv.slice(), av: best.av.slice(), score: best.score };
-    let noImprove = 0;
+    // Convergence is tracked against the GLOBAL best, counting whole restart cycles
+    // (climb → stall → perturb) that fail to beat it. After `patience` fruitless
+    // restarts the run always terminates — so "unlimited time" = run to convergence,
+    // never an infinite loop.
+    let failedRestarts = 0, improvedBestSincePerturb = false;
     const timeLeft = () => performance.now() - t0 < timeMs;
-    while (timeLeft() && noImprove <= patience) {
+    const stopped = () => !!(opts.shouldStop && opts.shouldStop());
+    while (timeLeft() && failedRestarts <= patience && !stopped()) {
       const cands = [];
       for (const m of talentMoves(cur.tv)) cands.push({ k: 't', m });
       for (const m of attrMoves(cur.av)) cands.push({ k: 'a', m });
@@ -370,7 +375,7 @@
       for (let i = cands.length - 1; i > 0; i--) { const j = rand(i + 1); const t = cands[i]; cands[i] = cands[j]; cands[j] = t; }
       const capPerWave = Math.min(cands.length, Math.max(POOL_N * 4, 24));
       let improved = null;
-      for (let i = 0; i < capPerWave && !improved && timeLeft();) {
+      for (let i = 0; i < capPerWave && !improved && timeLeft() && !stopped();) {
         const batch = cands.slice(i, i + POOL_N); i += batch.length;
         const scored = await Promise.all(batch.map(async c => ({
           c, s: c.k === 't' ? await evalVec(c.m, cur.av) : await evalVec(cur.tv, c.m),
@@ -383,10 +388,11 @@
         cur = improved.c.k === 't'
           ? { tv: improved.c.m, av: cur.av, score: improved.s }
           : { tv: cur.tv, av: improved.c.m, score: improved.s };
-        noImprove = 0;
-        if (cur.score > best.score) best = { tv: cur.tv.slice(), av: cur.av.slice(), score: cur.score };
+        if (cur.score > best.score) { best = { tv: cur.tv.slice(), av: cur.av.slice(), score: cur.score }; improvedBestSincePerturb = true; }
       } else {
-        noImprove++;
+        // Reached a local optimum (end of a climb). Count the restart cycle.
+        if (improvedBestSincePerturb) failedRestarts = 0; else failedRestarts++;
+        improvedBestSincePerturb = false;
         cur = { tv: best.tv.slice(), av: best.av.slice(), score: best.score };
         for (let k = 0; k < 3; k++) { const tm = talentMoves(cur.tv); if (tm.length) cur.tv = tm[rand(tm.length)]; }
         for (let k = 0; k < 3; k++) { const am = attrMoves(cur.av); if (am.length) cur.av = am[rand(am.length)]; }
@@ -527,7 +533,8 @@
     if (curHunter && hunterIds.includes(curHunter)) $('#cifi-hunter').value = curHunter;
     fillBuilds();
 
-    $('#cifi-run').onclick = async () => {
+    const runBtn = $('#cifi-run');
+    async function startRun() {
       const h = $('#cifi-hunter').value;
       const list = $('#cifi-build').__list || buildsFor(h);
       const build = list[+$('#cifi-build').value];
@@ -536,27 +543,37 @@
       const finalIters = Math.max(1000, +$('#cifi-fi').value || 10000);
       const tmSec = Math.max(0, +$('#cifi-tm').value || 0);
       const timeMs = tmSec > 0 ? tmSec * 1000 : Infinity; // 0 = unlimited (run to convergence)
-      $('#cifi-run').disabled = true; $('#cifi-out').innerHTML = '';
+      let stopFlag = false;
+      $('#cifi-out').innerHTML = '';
       $('#cifi-status').textContent = 'Warming up engine…';
+      // Turn the button into a Stop control for the duration of the run.
+      runBtn.textContent = '⏹ Stop'; runBtn.disabled = false;
+      runBtn.onclick = () => {
+        stopFlag = true; runBtn.textContent = 'Stopping…'; runBtn.disabled = true;
+        $('#cifi-status').textContent = 'Stopping — reporting best found so far…';
+      };
       try {
         const ctx = buildContext(h);
         const t0 = performance.now();
         const res = await optimize(h, build, {
           pool: await ensurePool(), ctx, searchIters, finalIters, timeMs,
-          margin: 0.0005, patience: 4,
+          margin: 0.0005, patience: 4, shouldStop: () => stopFlag,
         }, (p) => {
           const pct = Math.min(98, (p.evals / Math.max(1, (p.evals + 40))) * 100);
           $('#cifi-bar').style.width = pct + '%';
           $('#cifi-status').textContent =
-            `Searching… ${p.evals} evals · best ${fmt(p.score)} · ${(p.elapsed||0).toFixed(0)}s`;
+            `${stopFlag ? 'Stopping' : 'Searching'}… ${p.evals} evals · best ${fmt(p.score)} · ${(p.elapsed||0).toFixed(0)}s`;
         });
         $('#cifi-bar').style.width = '100%';
         renderResult($, res, (performance.now() - t0) / 1000);
       } catch (e) {
         $('#cifi-status').textContent = 'Error: ' + (e && e.message || e);
         console.error('[CIFI Optimizer]', e);
-      } finally { $('#cifi-run').disabled = false; }
-    };
+      } finally {
+        runBtn.textContent = 'Optimize'; runBtn.disabled = false; runBtn.onclick = startRun;
+      }
+    }
+    runBtn.onclick = startRun;
   }
 
   function renderResult($, res, secs) {
