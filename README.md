@@ -20,16 +20,52 @@ Loot Score exactly.
   the result directly as a new build.
 - Runs entirely in the page; uses a pool of the site's evaluation workers.
 
-## Install (unpacked)
+## Install
+
+You need a local copy of this repo so Chrome can load the extension, and so you can
+pull updates later. Pick whichever is easier for you.
+
+### Step 1 — Get the code
+
+**Easiest (GitHub Desktop, no command line):**
+
+1. Install GitHub Desktop: <https://desktop.github.com> and open it. (If it asks you
+   to sign in, a free GitHub account works — or use the command-line option below,
+   which needs no account.)
+2. **File → Clone repository → URL** tab, paste
+   `https://github.com/Andy1292-tower/cifi-loot-optimizer`, choose a folder you'll
+   remember (e.g. Documents), and click **Clone**.
+
+**Command line** (no GitHub account needed — this is a public repo):
+
+1. Install Git — Windows: <https://git-scm.com/download/win> (install with defaults);
+   macOS: run `xcode-select --install` in Terminal.
+2. Clone it (no login prompt):
+   ```
+   git clone https://github.com/Andy1292-tower/cifi-loot-optimizer
+   ```
+
+### Step 2 — Load it into Chrome
 
 1. Open `chrome://extensions`
-2. Enable **Developer mode** (top-right)
-3. Click **Load unpacked** and select the [`cifi-optimizer-extension/`](cifi-optimizer-extension) folder
-4. Open (or reload) **cifi-tools.com** — the 🎯 button appears bottom-right
+2. Enable **Developer mode** (top-right toggle)
+3. Click **Load unpacked**
+4. Open the folder you cloned and select the **[`cifi-optimizer-extension/`](cifi-optimizer-extension)**
+   subfolder — ⚠️ the subfolder, not the top-level folder — then **Select**
+5. Open (or reload) **cifi-tools.com** — the 🎯 button appears bottom-right
 
-To update after pulling changes: `chrome://extensions` → click the ↻ reload on the
-card, then reload the site. The extension's version is printed to the console on load
-(`[CIFI Optimizer vX.Y.Z] …`) so you can confirm which build is running.
+## Updating
+
+When a new version is deployed, sync your local copy and reload:
+
+1. **Pull the update**
+   - GitHub Desktop: click **Fetch origin**, then **Pull origin**.
+   - Command line: `cd cifi-loot-optimizer` then `git pull --rebase`.
+2. `chrome://extensions` → click the **↻ reload** icon on the CIFI card.
+3. Reload cifi-tools.com.
+
+To confirm the update took, open the console (**F12 → Console**) — the loaded version
+is printed on load as `[CIFI Optimizer vX.Y.Z] …`.
 
 ## Usage
 
