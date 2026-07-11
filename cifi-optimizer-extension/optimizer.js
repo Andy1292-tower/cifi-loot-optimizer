@@ -292,12 +292,23 @@
     const aIdx = {}; attrs.forEach((a, i) => { aIdx[a.k] = i; });
     const deps = DEPS[hunterId] || {}, minval = MINVAL[hunterId] || {};
     function attrValid(v) {
-      const total = attrTotal(v);
+      const active = [];
       for (let i = 0; i < v.length; i++) if (v[i] > 0) {
         if (v[i] > attrs[i].eff) return false;
         const ps = deps[attrs[i].k];
         if (ps) for (const p of ps) { const pi = aIdx[p]; if (pi == null || v[pi] < 1) return false; }
-        if (total < (minval[attrs[i].k] || 0)) return false;
+        active.push(i);
+      }
+      // Sequencing check: an attribute's min-value gate must be met by points
+      // ALREADY invested when its first point is placed — not by the final total
+      // (which would let an attribute count its own points toward its own gate).
+      // Pour points in ascending min-value order; before opening each attribute,
+      // the points spent so far must reach its threshold.
+      active.sort((a, b) => (minval[attrs[a].k] || 0) - (minval[attrs[b].k] || 0));
+      let spent = 0;
+      for (const i of active) {
+        if (spent < (minval[attrs[i].k] || 0)) return false;
+        spent += v[i] * attrs[i].cost;
       }
       return true;
     }
