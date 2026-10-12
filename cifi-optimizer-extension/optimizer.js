@@ -1,511 +1,686 @@
-/* ============================================================================
- * CIFI Tools — Loot Score Auto-Optimizer (companion module)
- *
- * Adds an "🎯 Optimize" button to the app. For a chosen build it redistributes
- * the build's EXISTING talent + attribute points to maximise Loot Score
- * (result.lootPerMin), scoring candidates with the app's own WASM evaluation
- * worker. Talent points cost 1 each; attribute points have per-rank costs.
- * The current build is always feasible, so results are always achievable.
- *
- * Non-destructive: results are saved as a NEW build ("<name> (optimized)").
- * ========================================================================== */
+// CIFI Tools Loot Score optimizer
+//
+// Adds a 🎯 Optimize button to cifi-tools.com. Pick a build and it reshuffles
+// that build's existing talent and attribute points to get the highest Loot
+// Score (result.lootPerMin). Every candidate is scored by the site's own
+// evaluation worker, so the numbers match what the app shows.
+//
+// It never invents points: talents cost 1 each, attributes have their own
+// per-rank costs, and both totals stay exactly where they were. The result is
+// saved as a new build, so the original is never touched.
 (function () {
   'use strict';
   if (window.__cifiOptimizerLoaded) return;
   window.__cifiOptimizerLoaded = true;
-  console.log('%c[CIFI Optimizer v1.3.0] loaded (3 modes: Balanced, Thorough, Exploratory) — waiting for app…', 'color:#8b5cf6;font-weight:bold');
 
-  // Worker URL is discovered at runtime (the deployed asset hash can change).
-  let WORKER_URL = null;
-  async function resolveWorkerUrl() {
-    if (WORKER_URL) return WORKER_URL;
-    let u = performance.getEntriesByType('resource').map(e => e.name)
-      .find(n => /assets\/evaluationWorker-[\w-]+\.js/.test(n));
-    if (!u) {
-      const mod = [...document.querySelectorAll('script[type=module][src]')].map(s => s.src).find(Boolean);
-      if (mod) try {
-        const t = await fetch(mod).then(r => r.text());
-        const m = t.match(/[\w./-]*assets\/evaluationWorker-[\w-]+\.js/);
-        if (m) u = m[0].startsWith('http') || m[0].startsWith('/') ? m[0] : '/' + m[0];
-      } catch (e) {}
+  // Bump this together with manifest.json so the console shows which version loaded.
+  const VERSION = '1.3.1';
+  const TAG = '[CIFI Optimizer]';
+  console.log(`%c[CIFI Optimizer v${VERSION}] loaded, waiting for the app…`, 'color:#8b5cf6;font-weight:bold');
+
+  const HUNTERS = ['borge', 'ozzy', 'knox'];
+
+  // Small helpers
+  const clone = (o) => JSON.parse(JSON.stringify(o ?? {}));
+  const pointsIn = (obj, key) => +obj?.[key] || 0;
+  const randInt = (n) => Math.floor(Math.random() * n);
+  const gcd = (a, b) => (b ? gcd(b, a % b) : a);
+  const lcm = (a, b) => (a * b) / gcd(a, b);
+  const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = randInt(i + 1);
+      [arr[i], arr[j]] = [arr[j], arr[i]];
     }
-    WORKER_URL = u || '/assets/evaluationWorker-BKbzsoAA.js';
-    return WORKER_URL;
+    return arr;
   }
 
-  // ---- Static game data: talents (cost 1) and attributes (per-rank cost) ----
-  // max: game default cap (effective cap is raised to whatever the account has
-  // actually reached across the user's builds). Infinity = uncapped.
+  // The worker's file name includes a content hash that changes whenever the
+  // site redeploys, so we look it up at runtime: first among scripts the page
+  // has already loaded, then by searching the main bundle. The hard-coded name
+  // is only a last resort and will go stale.
+  let workerUrl = null;
+  async function resolveWorkerUrl() {
+    if (workerUrl) return workerUrl;
+    let url = performance.getEntriesByType('resource')
+      .map((e) => e.name)
+      .find((name) => /assets\/evaluationWorker-[\w-]+\.js/.test(name));
+    const bundle = document.querySelector('script[type=module][src]')?.src;
+    if (!url && bundle) {
+      try {
+        const source = await fetch(bundle).then((r) => r.text());
+        const match = source.match(/[\w./-]*assets\/evaluationWorker-[\w-]+\.js/);
+        if (match) url = match[0].startsWith('/') ? match[0] : '/' + match[0];
+      } catch (e) { /* fall back to the default below */ }
+    }
+    workerUrl = url || '/assets/evaluationWorker-BKbzsoAA.js';
+    return workerUrl;
+  }
+
+  // ---- Game data ----
+  // Has to match the live game. When the site changes caps, costs or the
+  // attribute tree, update these tables.
+
+  // talents: [key, cap]. Every talent point costs 1.
+  // attrs:   [key, cap, cost per rank]. INF means no cap.
+  // These are the default caps. The optimizer raises a cap if the account has
+  // already gone past it in any build.
   const INF = Infinity;
   const DATA = {
     borge: {
-      talents: [ ['revival',2],['loth',5],['ua',5],['impeccable',10],['omen',10],['ll',10],['pog',15],['ultima',50],['tfow',15] ],
-      attrs: [ ['ares',INF,1],['ylith',INF,1],['spartan',6,2],['timeless',5,3],['battle',3,5],['athena',1,15],['baal',6,3],['sensors',6,2],['atlas',6,3],['mino',20,2],['htb',10,2],['exp',6,3],['weak',6,2],['hermes',20,2],['lfin',10,2] ],
+      talents: [['revival', 2], ['loth', 5], ['ua', 5], ['impeccable', 10], ['omen', 10], ['ll', 10], ['pog', 15], ['ultima', 50], ['tfow', 15]],
+      attrs: [['ares', INF, 1], ['ylith', INF, 1], ['spartan', 6, 2], ['timeless', 5, 3], ['battle', 3, 5], ['athena', 1, 15], ['baal', 6, 3], ['sensors', 6, 2],
+        ['atlas', 6, 3], ['mino', 20, 2], ['htb', 10, 2], ['exp', 6, 3], ['weak', 6, 2], ['hermes', 20, 2], ['lfin', 10, 2]],
     },
     ozzy: {
-      talents: [ ['revival',2],['boon',1],['ua',5],['needles',10],['omen',10],['ll',10],['crip',15],['ultima',50],['echo',20] ],
-      attrs: [ ['lotl',INF,1],['exo',INF,1],['scorp',5,3],['dance',4,3],['cat',20,2],['timeless',5,3],['ibu',5,2],['exterm',5,2],['medusa',5,3],['scarab',20,2],['vect',10,2],['snek',5,3],['cycle',5,3],['deal',3,5],['sisters',1,15] ],
+      talents: [['revival', 2], ['boon', 1], ['ua', 5], ['needles', 10], ['omen', 10], ['ll', 10], ['crip', 15], ['ultima', 50], ['echo', 20]],
+      attrs: [['lotl', INF, 1], ['exo', INF, 1], ['scorp', 5, 3], ['dance', 4, 3], ['cat', 20, 2], ['timeless', 5, 3], ['ibu', 5, 2], ['exterm', 5, 2],
+        ['medusa', 5, 3], ['scarab', 20, 2], ['vect', 10, 2], ['snek', 5, 3], ['cycle', 5, 3], ['deal', 3, 5], ['sisters', 1, 15]],
     },
     knox: {
-      talents: [ ['revival',2],['calyp',5],['ua',5],['ghost',15],['omen',10],['ll',10],['pog',10],['ultima',50],['finish',15] ],
-      attrs: [ ['kraken',INF,1],['soul',100,1],['dead',10,2],['sear',5,2],['pl',10,3],['time',5,3],['kot',5,5],['pct',10,4],['spa',50,2],['fe',10,2],['sop',10,3] ],
+      talents: [['revival', 2], ['calyp', 5], ['ua', 5], ['ghost', 15], ['omen', 10], ['ll', 10], ['pog', 10], ['ultima', 50], ['finish', 15]],
+      attrs: [['kraken', INF, 1], ['soul', 100, 1], ['dead', 10, 2], ['sear', 5, 2], ['pl', 10, 3], ['time', 5, 3], ['kot', 5, 5], ['pct', 10, 4],
+        ['spa', 50, 2], ['fe', 10, 2], ['sop', 10, 3]],
     },
   };
-  const LABELS = { revival:'Death Is My Companion',loth:'Life of the Hunt',ua:'The Unfair Advantage',impeccable:'Impeccable Impacts',omen:'The Omen Of Defeat',ll:'Call Me Lucky Loot',pog:'Presence Of A God',ultima:'The Legacy of Ultima',tfow:'The Fires of War',boon:"Tricksters Boon",needles:'Thousand Needles',crip:'Crippling Shots',echo:'Echo Bullets',calyp:"Calypso's Advantage",ghost:'Ghost Bullets',finish:'Finishing Move',
-    ares:'Soul Of Ares',ylith:'Essence Of Ylith',spartan:'Spartan Lineage',timeless:'Timeless Mastery',battle:'Born For Battle',athena:'Soul Of Athena',baal:'Book Of Baal',sensors:'Superior Sensors',atlas:'The Atlas Protocol',mino:'Soul Of The Minotaur',htb:'Helltouch Barrier',exp:'Explosive Punches',weak:'Weakspot Analysis',hermes:'Soul Of Hermes',lfin:'Lifedrain Inhaler',
-    lotl:'Living Off The Land',exo:'Exo Piercers',scorp:'Shimmering Scorpions',dance:'Dance Of Dashes',cat:'Blessing Of The Cat',ibu:'Wings Of Ibu',exterm:'Extermination Protocol',medusa:'Gift Of Medusa',scarab:'Blessing Of The Scarab',vect:'Vectid Elixir',snek:'Soul Of Snek',cycle:'The Cycle Of Death',deal:'A Deal With Death',sisters:'Blessing Of The Sisters',
-    kraken:'Release The Kraken',soul:'Soul Amplification',dead:'Dead Men Tell No Tales',sear:'Searious Efficiency',pl:'A Pirates Life for Knox',time:'Timeless Mastery',kot:'King Of Torpedos',pct:'Passive Charge Tank',spa:'Space Pirate Armory',fe:'Fortification Elixir',sop:'Shield of Poseidon' };
 
-  // Attribute prerequisite tree (from ATTRIBUTE_DEPENDENCIES): X needs every
-  // listed parent at >=1 before it can hold points. Talents have no tree.
-  const DEPS = {
-    borge: {ylith:['ares'],baal:['ares'],htb:['ares'],exp:['htb'],spartan:['ylith'],timeless:['spartan'],sensors:['baal'],lfin:['htb'],atlas:['sensors'],weak:['exp'],battle:['spartan'],athena:['battle'],mino:['atlas'],hermes:['weak']},
-    ozzy: {exo:['lotl'],ibu:['lotl'],scorp:['exo'],timeless:['exo'],exterm:['ibu'],snek:['exterm'],vect:['exterm'],cycle:['snek'],deal:['cycle'],medusa:['exterm'],dance:['scorp'],sisters:['deal'],scarab:['medusa'],cat:['dance']},
-    knox: {soul:['kraken'],dead:['soul'],spa:['kraken'],pl:['spa'],time:['pl'],sear:['kraken'],pct:['sear'],kot:['pct'],fe:['kraken'],sop:['fe']},
-  };
-  // Total attribute points that must be spent before X unlocks (ATTRIBUTE_MIN_VALUE).
-  const MINVAL = {
-    borge: {ares:0,ylith:0,spartan:0,timeless:0,baal:0,sensors:0,htb:0,lfin:0,exp:0,atlas:75,weak:75,battle:75,mino:150,hermes:150,athena:180},
-    ozzy: {lotl:0,exo:0,scorp:0,timeless:0,ibu:0,exterm:0,snek:0,vect:0,cycle:0,deal:90,medusa:90,dance:90,sisters:180,scarab:150,cat:150},
-    knox: {kraken:0,soul:0,dead:0,spa:0,pl:0,time:0,sear:0,pct:0,kot:0,fe:0,sop:0},
+  const LABELS = {
+    // talents
+    revival: 'Death Is My Companion', ua: 'The Unfair Advantage', omen: 'The Omen Of Defeat', ll: 'Call Me Lucky Loot',
+    pog: 'Presence Of A God', ultima: 'The Legacy of Ultima', loth: 'Life of the Hunt', impeccable: 'Impeccable Impacts',
+    tfow: 'The Fires of War', boon: 'Tricksters Boon', needles: 'Thousand Needles', crip: 'Crippling Shots', echo: 'Echo Bullets',
+    calyp: "Calypso's Advantage", ghost: 'Ghost Bullets', finish: 'Finishing Move',
+    // Borge attributes
+    ares: 'Soul Of Ares', ylith: 'Essence Of Ylith', spartan: 'Spartan Lineage', timeless: 'Timeless Mastery', battle: 'Born For Battle',
+    athena: 'Soul Of Athena', baal: 'Book Of Baal', sensors: 'Superior Sensors', atlas: 'The Atlas Protocol', mino: 'Soul Of The Minotaur',
+    htb: 'Helltouch Barrier', exp: 'Explosive Punches', weak: 'Weakspot Analysis', hermes: 'Soul Of Hermes', lfin: 'Lifedrain Inhaler',
+    // Ozzy attributes
+    lotl: 'Living Off The Land', exo: 'Exo Piercers', scorp: 'Shimmering Scorpions', dance: 'Dance Of Dashes', cat: 'Blessing Of The Cat',
+    ibu: 'Wings Of Ibu', exterm: 'Extermination Protocol', medusa: 'Gift Of Medusa', scarab: 'Blessing Of The Scarab', vect: 'Vectid Elixir',
+    snek: 'Soul Of Snek', cycle: 'The Cycle Of Death', deal: 'A Deal With Death', sisters: 'Blessing Of The Sisters',
+    // Knox attributes
+    kraken: 'Release The Kraken', soul: 'Soul Amplification', dead: 'Dead Men Tell No Tales', sear: 'Searious Efficiency',
+    pl: 'A Pirates Life for Knox', time: 'Timeless Mastery', kot: 'King Of Torpedos', pct: 'Passive Charge Tank',
+    spa: 'Space Pirate Armory', fe: 'Fortification Elixir', sop: 'Shield of Poseidon',
   };
 
-  // ===== Build-code (share hash) encoder — replicates the app's kX/TX/base58 =====
+  // Attribute tree (the app's ATTRIBUTE_DEPENDENCIES): an attribute can only hold
+  // points once each attribute listed for it has at least 1. Talents have no tree.
+  const REQUIRES = {
+    borge: { ylith: ['ares'], baal: ['ares'], htb: ['ares'], exp: ['htb'], spartan: ['ylith'], timeless: ['spartan'], sensors: ['baal'],
+      lfin: ['htb'], atlas: ['sensors'], weak: ['exp'], battle: ['spartan'], athena: ['battle'], mino: ['atlas'], hermes: ['weak'] },
+    ozzy: { exo: ['lotl'], ibu: ['lotl'], scorp: ['exo'], timeless: ['exo'], exterm: ['ibu'], snek: ['exterm'], vect: ['exterm'],
+      cycle: ['snek'], deal: ['cycle'], medusa: ['exterm'], dance: ['scorp'], sisters: ['deal'], scarab: ['medusa'], cat: ['dance'] },
+    knox: { soul: ['kraken'], dead: ['soul'], spa: ['kraken'], pl: ['spa'], time: ['pl'], sear: ['kraken'], pct: ['sear'],
+      kot: ['pct'], fe: ['kraken'], sop: ['fe'] },
+  };
+
+  // How many attribute points have to be spent before each attribute unlocks
+  // (the app's ATTRIBUTE_MIN_VALUE). Anything not listed unlocks at 0.
+  const UNLOCK_AT = {
+    borge: { atlas: 75, weak: 75, battle: 75, mino: 150, hermes: 150, athena: 180 },
+    ozzy: { deal: 90, medusa: 90, dance: 90, scarab: 150, cat: 150, sisters: 180 },
+    knox: {},
+  };
+
+  // ---- Build codes ----
+  // Our own copy of the site's share-code format, so the result can be pasted
+  // straight into the app's Import box.
+
   const HUNTER_KIND = { borge: 1, ozzy: 3, knox: 6 };
   const BASE_STATS = {
-    borge: ['hp','atk','regen','dr','evade','effect','critchance','critpower','atkspeed','stage'],
-    ozzy: ['hp','atk','regen','dr','evade','effect','multichance','multipower','atkspeed','stage'],
-    knox: ['hp','atk','regen','dr','block','effect','charge','chargeGain','reload','proj','stage'],
+    borge: ['hp', 'atk', 'regen', 'dr', 'evade', 'effect', 'critchance', 'critpower', 'atkspeed', 'stage'],
+    ozzy: ['hp', 'atk', 'regen', 'dr', 'evade', 'effect', 'multichance', 'multipower', 'atkspeed', 'stage'],
+    knox: ['hp', 'atk', 'regen', 'dr', 'block', 'effect', 'charge', 'chargeGain', 'reload', 'proj', 'stage'],
   };
-  const QZ = {'borge-loot-bonus':'attraction_lootBorge','ozzy-loot-bonus':'attraction_lootOzzy','knox-loot-bonus':'attraction_lootKnox','catch-up-power-borge-ozzy':'attraction_catchUp','catch-up-power':'attraction_catchUp','catch-up-power-knox':'attraction_catchUp2','borge-stat-bonus':'creation_borgeGU','ozzy-stat-bonus':'creation_ozzyGU','knox-stat-bonus':'creation_knoxGU'};
-  // BUILD_CODE_PARAMS per hunter (aD/bD/PD), exact order.
-  const PARAMS = {
-    borge: ["revival","loth","ua","impeccable","omen","ll","pog","tfow","ares","ylith","spartan","timeless","baal","sensors","htb","lfin","exp","atlas","weak","battle","hp","atk","regen","dr","evade","effect","critchance","critpower","atkspeed","upgrades.loopmods.trample","upgrades.relics.r4","upgrades.relics.r16","upgrades.relics.r19","upgrades.inscryptions.i3","upgrades.inscryptions.i4","upgrades.inscryptions.i11","upgrades.inscryptions.i13","upgrades.inscryptions.i23","upgrades.inscryptions.i24","upgrades.inscryptions.i27","upgrades.inscryptions.i60","upgrades.gems_nodes.creation_gem1","upgrades.gems_nodes.creation_gem2","upgrades.gems_nodes.creation_gem3","upgrades.gems_nodes.innovation_gem3","upgrades.gems_nodes.attraction_gem2","upgrades.gems_nodes.attraction_level","upgrades.gems_nodes.attraction_catchUp","upgrades.inscryptions.i84","upgrades.inscryptions.i87","upgrades.inscryptions.i88","upgrades.inscryptions.i89","upgrades.inscryptions.i91","ultima","athena","mino","hermes","upgrades.gadgets.wrench","upgrades.diamondcards.gaiden","upgrades.diamondspecials.reviveboost","upgrades.gems_nodes.creation_borgeGU","upgrades.gems_nodes.evolution_gem3","upgrades.gems_nodes.temporal_gem4","upgrades.loopmods.stelzi","upgrades.inscryptions.i103","upgrades.gems_nodes.exodus_gem3","upgrades.gems_nodes.exodus_gem4","upgrades.cms.milestoneCount","upgrades.gems_nodes.temporal_gem6","upgrades.gems_nodes.creation_gem4","upgrades.gems_nodes.creation_gem5","upgrades.gems_nodes.evolution_gem6","upgrades.relics.t2r7","upgrades.gems_nodes.power_level"],
-    ozzy: ["revival","boon","ua","needles","omen","ll","crip","echo","lotl","exo","scorp","timeless","ibu","exterm","snek","vect","cycle","deal","medusa","dance","hp","atk","regen","dr","evade","effect","multichance","multipower","atkspeed","upgrades.relics.r4","upgrades.relics.r17","upgrades.inscryptions.i31","upgrades.inscryptions.i36","upgrades.inscryptions.i37","upgrades.inscryptions.i40","upgrades.gems_nodes.innovation_gem2","upgrades.gems_nodes.innovation_gem3","upgrades.gems_nodes.attraction_level","upgrades.gems_nodes.attraction_catchUp","upgrades.inscryptions.i86","upgrades.inscryptions.i92","ultima","sisters","scarab","cat","upgrades.gadgets.zaptron","upgrades.diamondcards.iridian","upgrades.diamondspecials.reviveboost","upgrades.gems_nodes.creation_ozzyGU","upgrades.gems_nodes.evolution_gem3","upgrades.loopmods.stelzi","upgrades.gems_nodes.exodus_gem3","upgrades.gems_nodes.exodus_gem4","upgrades.cms.milestoneCount","upgrades.gems_nodes.temporal_gem6","upgrades.gems_nodes.creation_gem4","upgrades.gems_nodes.creation_gem5","upgrades.gems_nodes.creation_gem6","upgrades.gems_nodes.evolution_gem6","upgrades.relics.t2r7","upgrades.gems_nodes.power_level"],
-    knox: ["revival","calyp","ua","ghost","omen","ll","pog","finish","ultima","kraken","spa","pl","time","soul","dead","fe","sop","sear","pct","kot","hp","atk","regen","dr","block","effect","charge","chargeGain","reload","proj","upgrades.diamondspecials.reviveboost","stage","upgrades.gadgets.anchor","upgrades.gems_nodes.creation_knoxGU","upgrades.gems_nodes.evolution_gem3","upgrades.gems_nodes.exodus_gem4","upgrades.cms.milestoneCount","upgrades.gems_nodes.temporal_gem6","upgrades.gems_nodes.creation_gem4","upgrades.gems_nodes.creation_gem5","upgrades.gems_nodes.power_gem6","upgrades.gems_nodes.evolution_gem6","upgrades.gems_nodes.attraction_level","upgrades.gems_nodes.attraction_catchUp2","upgrades.relics.t2r7","upgrades.gems_nodes.power_level"],
+
+  // Gem planner upgrade names that the app stores under a different key.
+  const GEM_UPGRADE_KEYS = {
+    'borge-loot-bonus': 'attraction_lootBorge', 'ozzy-loot-bonus': 'attraction_lootOzzy', 'knox-loot-bonus': 'attraction_lootKnox',
+    'catch-up-power-borge-ozzy': 'attraction_catchUp', 'catch-up-power': 'attraction_catchUp', 'catch-up-power-knox': 'attraction_catchUp2',
+    'borge-stat-bonus': 'creation_borgeGU', 'ozzy-stat-bonus': 'creation_ozzyGU', 'knox-stat-bonus': 'creation_knoxGU',
   };
-  const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-  function base58(bytes) {
-    const digits = [0];
-    for (const b of bytes) {
-      let carry = b;
-      for (let j = 0; j < digits.length; j++) { carry += digits[j] << 8; digits[j] = carry % 58; carry = (carry / 58) | 0; }
-      while (carry) { digits.push(carry % 58); carry = (carry / 58) | 0; }
-    }
-    let str = '';
-    for (let k = 0; k < bytes.length && bytes[k] === 0; k++) str += B58[0];
-    for (let q = digits.length - 1; q >= 0; q--) str += B58[digits[q]];
-    return str;
+
+  // The values packed into a build code, in order. These must match the app's
+  // BUILD_CODE_PARAMS exactly. If the order is off by one, the code decodes to garbage.
+  const BUILD_CODE_PARAMS = {
+    borge: ['revival', 'loth', 'ua', 'impeccable', 'omen', 'll', 'pog', 'tfow', 'ares', 'ylith', 'spartan', 'timeless', 'baal', 'sensors', 'htb', 'lfin', 'exp', 'atlas', 'weak', 'battle', 'hp', 'atk', 'regen', 'dr', 'evade', 'effect', 'critchance', 'critpower', 'atkspeed', 'upgrades.loopmods.trample', 'upgrades.relics.r4', 'upgrades.relics.r16', 'upgrades.relics.r19', 'upgrades.inscryptions.i3', 'upgrades.inscryptions.i4', 'upgrades.inscryptions.i11', 'upgrades.inscryptions.i13', 'upgrades.inscryptions.i23', 'upgrades.inscryptions.i24', 'upgrades.inscryptions.i27', 'upgrades.inscryptions.i60', 'upgrades.gems_nodes.creation_gem1', 'upgrades.gems_nodes.creation_gem2', 'upgrades.gems_nodes.creation_gem3', 'upgrades.gems_nodes.innovation_gem3', 'upgrades.gems_nodes.attraction_gem2', 'upgrades.gems_nodes.attraction_level', 'upgrades.gems_nodes.attraction_catchUp', 'upgrades.inscryptions.i84', 'upgrades.inscryptions.i87', 'upgrades.inscryptions.i88', 'upgrades.inscryptions.i89', 'upgrades.inscryptions.i91', 'ultima', 'athena', 'mino', 'hermes', 'upgrades.gadgets.wrench', 'upgrades.diamondcards.gaiden', 'upgrades.diamondspecials.reviveboost', 'upgrades.gems_nodes.creation_borgeGU', 'upgrades.gems_nodes.evolution_gem3', 'upgrades.gems_nodes.temporal_gem4', 'upgrades.loopmods.stelzi', 'upgrades.inscryptions.i103', 'upgrades.gems_nodes.exodus_gem3', 'upgrades.gems_nodes.exodus_gem4', 'upgrades.cms.milestoneCount', 'upgrades.gems_nodes.temporal_gem6', 'upgrades.gems_nodes.creation_gem4', 'upgrades.gems_nodes.creation_gem5', 'upgrades.gems_nodes.evolution_gem6', 'upgrades.relics.t2r7', 'upgrades.gems_nodes.power_level'],
+    ozzy: ['revival', 'boon', 'ua', 'needles', 'omen', 'll', 'crip', 'echo', 'lotl', 'exo', 'scorp', 'timeless', 'ibu', 'exterm', 'snek', 'vect', 'cycle', 'deal', 'medusa', 'dance', 'hp', 'atk', 'regen', 'dr', 'evade', 'effect', 'multichance', 'multipower', 'atkspeed', 'upgrades.relics.r4', 'upgrades.relics.r17', 'upgrades.inscryptions.i31', 'upgrades.inscryptions.i36', 'upgrades.inscryptions.i37', 'upgrades.inscryptions.i40', 'upgrades.gems_nodes.innovation_gem2', 'upgrades.gems_nodes.innovation_gem3', 'upgrades.gems_nodes.attraction_level', 'upgrades.gems_nodes.attraction_catchUp', 'upgrades.inscryptions.i86', 'upgrades.inscryptions.i92', 'ultima', 'sisters', 'scarab', 'cat', 'upgrades.gadgets.zaptron', 'upgrades.diamondcards.iridian', 'upgrades.diamondspecials.reviveboost', 'upgrades.gems_nodes.creation_ozzyGU', 'upgrades.gems_nodes.evolution_gem3', 'upgrades.loopmods.stelzi', 'upgrades.gems_nodes.exodus_gem3', 'upgrades.gems_nodes.exodus_gem4', 'upgrades.cms.milestoneCount', 'upgrades.gems_nodes.temporal_gem6', 'upgrades.gems_nodes.creation_gem4', 'upgrades.gems_nodes.creation_gem5', 'upgrades.gems_nodes.creation_gem6', 'upgrades.gems_nodes.evolution_gem6', 'upgrades.relics.t2r7', 'upgrades.gems_nodes.power_level'],
+    knox: ['revival', 'calyp', 'ua', 'ghost', 'omen', 'll', 'pog', 'finish', 'ultima', 'kraken', 'spa', 'pl', 'time', 'soul', 'dead', 'fe', 'sop', 'sear', 'pct', 'kot', 'hp', 'atk', 'regen', 'dr', 'block', 'effect', 'charge', 'chargeGain', 'reload', 'proj', 'upgrades.diamondspecials.reviveboost', 'stage', 'upgrades.gadgets.anchor', 'upgrades.gems_nodes.creation_knoxGU', 'upgrades.gems_nodes.evolution_gem3', 'upgrades.gems_nodes.exodus_gem4', 'upgrades.cms.milestoneCount', 'upgrades.gems_nodes.temporal_gem6', 'upgrades.gems_nodes.creation_gem4', 'upgrades.gems_nodes.creation_gem5', 'upgrades.gems_nodes.power_gem6', 'upgrades.gems_nodes.evolution_gem6', 'upgrades.gems_nodes.attraction_level', 'upgrades.gems_nodes.attraction_catchUp2', 'upgrades.relics.t2r7', 'upgrades.gems_nodes.power_level'],
+  };
+
+  // Upgrades are addressed with dotted keys like "upgrades.relics.r4" or
+  // "upgrades.gems_nodes.creation_gem1". Returns the path under `upgrades`, or
+  // null for any other shape (the app ignores those too).
+  function upgradePath(key) {
+    const path = key.split('.').slice(1);
+    return path.length === 2 || path.length === 3 ? path : null;
   }
-  function computeGemNodes(gemStates, upgrades) {
+  const getIn = (obj, path) => path.reduce((o, k) => o?.[k], obj);
+  function setIn(obj, path, value) {
+    let node = obj;
+    for (const k of path.slice(0, -1)) node = node[k] = node[k] || {};
+    node[path[path.length - 1]] = value;
+  }
+
+  // Before encoding, the app flattens the gem planner state into
+  // upgrades.gems_nodes, e.g. { creation_level: 3, creation_gem1: 1, ... }.
+  function flattenGems(gemStates, upgrades) {
     if (!gemStates) return;
-    upgrades.gems_nodes = {};
-    for (const [gem, st] of Object.entries(gemStates)) {
-      if (!st) continue;
-      upgrades.gems_nodes[gem + '_level'] = st.level > 0 ? st.level : 0;
-      if (Array.isArray(st.nodes)) st.nodes.forEach((a, r) => { upgrades.gems_nodes[gem + '_gem' + (r + 1)] = a ? 1 : 0; });
-      if (st.upgrades) for (const [k, v] of Object.entries(st.upgrades)) { const m = QZ[k]; upgrades.gems_nodes[m || (gem + '_' + k)] = v; }
+    const nodes = upgrades.gems_nodes = {};
+    for (const [gem, state] of Object.entries(gemStates)) {
+      if (!state) continue;
+      nodes[gem + '_level'] = state.level > 0 ? state.level : 0;
+      if (Array.isArray(state.nodes)) state.nodes.forEach((on, i) => { nodes[`${gem}_gem${i + 1}`] = on ? 1 : 0; });
+      for (const [k, v] of Object.entries(state.upgrades || {})) nodes[GEM_UPGRADE_KEYS[k] || `${gem}_${k}`] = v;
     }
   }
-  function codeContext(hunterId, build) {
+
+  // The account-wide state a build code draws on (stats, upgrades, gems), with
+  // this build's overrides applied on top.
+  function encodingContext(hunterId, build) {
     const { hunter, gems } = stores();
-    const copy = (o) => JSON.parse(JSON.stringify(o == null ? {} : o));
-    const ctx = { hunterStats: copy(hunter.hunterStats), upgrades: copy(hunter.upgrades) };
-    const gemStates = (gems && gems.$state && gems.$state.gemStates) || (gems && gems.gemStates);
-    computeGemNodes(copy(gemStates), ctx.upgrades);
-    const ov = build.overrides || {};
-    for (const [k, v] of Object.entries(ov)) {
-      if (k.startsWith('upgrades.')) {
-        const p = k.split('.');
-        if (p.length === 3) { (ctx.upgrades[p[1]] = ctx.upgrades[p[1]] || {})[p[2]] = v; }
-        else if (p.length === 4) { const c = ctx.upgrades[p[1]] = ctx.upgrades[p[1]] || {}; (c[p[2]] = c[p[2]] || {})[p[3]] = v; }
-      } else { (ctx.hunterStats[hunterId] = ctx.hunterStats[hunterId] || {})[k] = v; }
+    const ctx = { hunterStats: clone(hunter.hunterStats), upgrades: clone(hunter.upgrades) };
+    flattenGems(clone(gems?.$state?.gemStates || gems?.gemStates), ctx.upgrades);
+    for (const [key, value] of Object.entries(build.overrides || {})) {
+      if (key.startsWith('upgrades.')) {
+        const path = upgradePath(key);
+        if (path) setIn(ctx.upgrades, path, value);
+      } else {
+        (ctx.hunterStats[hunterId] = ctx.hunterStats[hunterId] || {})[key] = value;
+      }
     }
     return ctx;
   }
-  function extractParamValue(param, build, ctx, hunterId) {
+
+  // Looks a param up the same way the app does: overrides first, then talents,
+  // attributes, base stats, and finally account upgrades.
+  function paramValue(param, build, ctx, hunterId) {
     if (build.overrides && param in build.overrides) return build.overrides[param] ?? 0;
     if (build.talents && param in build.talents) return build.talents[param] ?? 0;
     if (build.attributes && param in build.attributes) return build.attributes[param] ?? 0;
-    if ((BASE_STATS[hunterId] || []).includes(param))
-      return (ctx.hunterStats && ctx.hunterStats[hunterId] && ctx.hunterStats[hunterId][param]) ?? 0;
+    if ((BASE_STATS[hunterId] || []).includes(param)) return ctx.hunterStats?.[hunterId]?.[param] ?? 0;
     if (param === 'lvl') return build.level ?? 0;
     if (param.startsWith('upgrades.')) {
-      const p = param.split('.');
-      if (p.length === 3) return (ctx.upgrades?.[p[1]]?.[p[2]]) ?? 0;
-      if (p.length === 4) return (ctx.upgrades?.[p[1]]?.[p[2]]?.[p[3]]) ?? 0;
-      return 0;
+      const path = upgradePath(param);
+      return (path && getIn(ctx.upgrades, path)) ?? 0;
     }
     return 0;
   }
-  function packBuffer(kind, levels) {
-    const out = [101, (kind << 5) | 0];
-    for (let i = 0; i < levels.length; i += 4) {
-      const group = levels.slice(i, i + 4).map(x => {
-        let v = Math.round(+x) || 0; if (v < 0) v = 0; if (v > 65535) v = 65535;
-        const tag = v === 0 ? 0 : v === 1 ? 1 : v <= 255 ? 2 : 3;
-        return [v, tag];
-      });
-      while (group.length < 4) group.push([0, 0]);
-      out.push(group.reduce((acc, g) => (acc << 2) | g[1], 0));
-      group.forEach(([v, t]) => { if (t === 2) out.push(v & 255); else if (t === 3) { out.push((v >> 8) & 255); out.push(v & 255); } });
+
+  // Byte layout, copied from the app: a fixed 101 byte, a header byte with the
+  // hunter kind in its top three bits, then the values in groups of four. Each
+  // group starts with one byte holding four 2-bit size tags (0 = the value is 0,
+  // 1 = it's 1, 2 = one byte follows, 3 = two bytes follow, high byte first),
+  // followed by those bytes. Values are rounded and clamped to 0..65535.
+  function packValues(kind, values) {
+    const out = [101, kind << 5];
+    const tagOf = (v) => (v === 0 ? 0 : v === 1 ? 1 : v <= 255 ? 2 : 3);
+    for (let i = 0; i < values.length; i += 4) {
+      const group = values.slice(i, i + 4).map((x) => Math.min(65535, Math.max(0, Math.round(+x) || 0)));
+      while (group.length < 4) group.push(0);
+      out.push(group.reduce((acc, v) => (acc << 2) | tagOf(v), 0));
+      for (const v of group) {
+        if (tagOf(v) === 2) out.push(v);
+        else if (tagOf(v) === 3) out.push(v >> 8, v & 255);
+      }
     }
     return Uint8Array.from(out);
   }
+
+  // Bitcoin-style base58: no 0, O, I or l. Leading zero bytes become '1'.
+  const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  function base58(bytes) {
+    const digits = [0];
+    for (const byte of bytes) {
+      let carry = byte;
+      for (let j = 0; j < digits.length; j++) {
+        carry += digits[j] << 8;
+        digits[j] = carry % 58;
+        carry = (carry / 58) | 0;
+      }
+      while (carry) {
+        digits.push(carry % 58);
+        carry = (carry / 58) | 0;
+      }
+    }
+    let str = '';
+    for (let k = 0; k < bytes.length && bytes[k] === 0; k++) str += BASE58_ALPHABET[0];
+    for (let q = digits.length - 1; q >= 0; q--) str += BASE58_ALPHABET[digits[q]];
+    return str;
+  }
+
   function generateBuildCode(build, hunterId) {
     try {
-      const ctx = codeContext(hunterId, build);
-      const vals = PARAMS[hunterId].map(p => extractParamValue(p, build, ctx, hunterId));
-      return base58(packBuffer(HUNTER_KIND[hunterId], vals));
-    } catch (e) { console.error('[CIFI Optimizer] build-code failed', e); return null; }
+      const ctx = encodingContext(hunterId, build);
+      const values = BUILD_CODE_PARAMS[hunterId].map((p) => paramValue(p, build, ctx, hunterId));
+      return base58(packValues(HUNTER_KIND[hunterId], values));
+    } catch (e) {
+      console.error(`${TAG} couldn't generate a build code`, e);
+      return null;
+    }
   }
 
-  // ------------------------------- Store access ------------------------------
-  function pinia() {
-    const app = document.querySelector('#app') && document.querySelector('#app').__vue_app__;
-    const p = app && app.config.globalProperties.$pinia;
-    return p && p._s ? p._s : null;
+  // ---- App state ----
+  // Everything we need is in the app's Pinia stores, reachable through the Vue
+  // app mounted on #app.
+
+  function piniaStores() {
+    const app = document.querySelector('#app')?.__vue_app__;
+    return app?.config.globalProperties.$pinia?._s ?? null;
   }
+
   function stores() {
-    const s = pinia(); if (!s) throw new Error('app not ready');
+    const s = piniaStores();
+    if (!s) throw new Error('app not ready');
     return { hunter: s.get('hunter'), gems: s.get('gemPlanner') };
   }
-  // Assemble the exact "context" object the app passes to evaluate().
-  function buildContext(hunterId) {
+
+  // The same context object the app hands to evaluate().
+  function appContext() {
     const { hunter, gems } = stores();
-    const plain = (o) => JSON.parse(JSON.stringify(o == null ? {} : o));
     return {
-      hunterStats: plain(hunter.hunterStats),
-      upgrades: plain(hunter.upgrades),
-      hunterIterations: plain(hunter.hunterIterations),
-      hunterSeedSettings: plain(hunter.hunterSeedSettings),
-      gemPlannerStore: plain(gems && gems.$state ? gems.$state : gems),
+      hunterStats: clone(hunter.hunterStats),
+      upgrades: clone(hunter.upgrades),
+      hunterIterations: clone(hunter.hunterIterations),
+      hunterSeedSettings: clone(hunter.hunterSeedSettings),
+      gemPlannerStore: clone(gems?.$state ?? gems),
     };
   }
+
   function buildsFor(hunterId) {
     const { hunter } = stores();
-    const list = (hunter.hunterBuilds && hunter.hunterBuilds[hunterId]) || [];
-    return list.map(b => JSON.parse(JSON.stringify(b)));
+    return (hunter.hunterBuilds?.[hunterId] || []).map((b) => clone(b));
   }
 
-  // ------------------------------- Worker pool -------------------------------
-  class Pool {
-    constructor(n) {
-      this.workers = [];
-      for (let i = 0; i < n; i++) {
-        const w = new Worker(WORKER_URL, { type: 'module' });
-        w.__busy = false;
-        this.workers.push(w);
-      }
-      this.q = [];
+  // Ultima and other advanced talents only open up at hunter level 70. If we
+  // can't tell, assume they're unlocked.
+  function advancedTalentsUnlocked(hunterId) {
+    try {
+      const { hunter } = stores();
+      if (typeof hunter.shouldShowAdvancedTalents === 'function') return !!hunter.shouldShowAdvancedTalents(hunterId);
+      return !!hunter.hunterLevelSettings?.[hunterId]?.showAdvancedTalents;
+    } catch (e) {
+      return true;
     }
+  }
+
+  // ---- Worker pool ----
+  // A few copies of the site's own evaluation worker. The worker talks Comlink,
+  // so we send Comlink-shaped messages by hand instead of loading the library.
+  class WorkerPool {
+    constructor(size) {
+      this.workers = Array.from({ length: size }, () => this._spawn());
+      this.busy = new Set();
+      this.queue = [];
+      this.nextId = 0;
+    }
+
+    get size() { return this.workers.length; }
+
+    _spawn() { return new Worker(workerUrl, { type: 'module' }); }
+
+    // Resolves with the app's result object, or null if the evaluation failed.
     evaluate(hunterId, build, ctx) {
-      return new Promise((resolve) => { this.q.push({ hunterId, build, ctx, resolve, tries: 0 }); this._pump(); });
+      return new Promise((resolve) => {
+        this.queue.push({ hunterId, build, ctx, resolve, retries: 0 });
+        this._pump();
+      });
     }
+
     _pump() {
-      while (this.q.length) {
-        const w = this.workers.find(x => !x.__busy);
-        if (!w) break;
-        w.__busy = true;
-        this._exec(w, this.q.shift());
+      while (this.queue.length) {
+        const worker = this.workers.find((w) => !this.busy.has(w));
+        if (!worker) break;
+        this.busy.add(worker);
+        this._run(worker, this.queue.shift());
       }
     }
-    _exec(w, job) {
-      const id = 'opt' + Math.random().toString(36).slice(2);
-      let settled = false;
-      // Stall timeout scales with the resolution being evaluated, so high iteration
-      // counts aren't killed; only a genuinely hung worker trips it.
-      const iters = (job.ctx && job.ctx.hunterIterations && job.ctx.hunterIterations[job.hunterId]) || 1000;
+
+    _run(worker, job) {
+      const id = 'opt' + ++this.nextId;
+
+      // The timeout grows with the iteration count, so a big but healthy run
+      // isn't cut off. It's only there to catch a worker that has hung.
+      const iters = job.ctx?.hunterIterations?.[job.hunterId] || 1000;
       const timeoutMs = Math.max(30000, iters * 3 + 10000);
-      const done = (val) => {
-        if (settled) return; settled = true; clearTimeout(timer);
-        w.removeEventListener('message', onmsg); w.__busy = false;
-        job.resolve(val); this._pump();
+
+      const finish = (value) => {
+        clearTimeout(timer);
+        worker.removeEventListener('message', onMessage);
+        this.busy.delete(worker);
+        job.resolve(value);
+        this._pump();
       };
-      const onmsg = (e) => { const d = e.data; if (!d || d.id !== id) return; done(d.type === 'THROW' ? null : d.value); };
-      w.addEventListener('message', onmsg);
+
+      // Comlink answers with { type: 'RAW', value } on success. A thrown error
+      // comes back as a 'HANDLER' message, which we count as a failed evaluation.
+      const onMessage = (e) => {
+        if (e.data?.id === id) finish(e.data.type === 'RAW' ? e.data.value : null);
+      };
+
+      // A hung worker can't be trusted again, so swap in a fresh one and retry
+      // the same candidate. After three retries, give up on that candidate.
       const timer = setTimeout(() => {
-        if (settled) return; settled = true;
-        w.removeEventListener('message', onmsg);
-        try { w.terminate(); } catch (e) {}
-        const idx = this.workers.indexOf(w);
-        if (idx >= 0) { const nw = new Worker(WORKER_URL, { type: 'module' }); nw.__busy = false; this.workers[idx] = nw; }
-        job.tries = (job.tries || 0) + 1;
-        if (job.tries <= 3) {
-          console.warn('[CIFI Optimizer] worker stalled — replaced it; re-running that evaluation (attempt ' + (job.tries + 1) + ')');
-          this.q.unshift(job);            // rerun the SAME candidate on a fresh worker
+        worker.removeEventListener('message', onMessage);
+        this.busy.delete(worker);
+        worker.terminate();
+        this.workers[this.workers.indexOf(worker)] = this._spawn();
+        if (++job.retries <= 3) {
+          console.warn(`${TAG} a worker stalled and was replaced. Retrying (attempt ${job.retries + 1}).`);
+          this.queue.unshift(job);
         } else {
-          console.warn('[CIFI Optimizer] evaluation failed after 3 retries — skipping candidate');
+          console.warn(`${TAG} still failing after 3 retries, skipping this candidate`);
           job.resolve(null);
         }
         this._pump();
       }, timeoutMs);
-      w.postMessage({ id, type: 'APPLY', path: ['evaluate'], argumentList: [
-        { type: 'RAW', value: job.hunterId }, { type: 'RAW', value: job.build }, { type: 'RAW', value: job.ctx },
-      ]});
+
+      worker.addEventListener('message', onMessage);
+      worker.postMessage({
+        id, type: 'APPLY', path: ['evaluate'],
+        argumentList: [job.hunterId, job.build, job.ctx].map((value) => ({ type: 'RAW', value })),
+      });
     }
-    destroy() { this.workers.forEach(w => w.terminate()); this.workers = []; }
   }
 
-  const scoreOf = (r) => (r && typeof r.lootPerMin === 'number') ? r.lootPerMin : -1;
+  let pool = null;
+  async function getPool() {
+    if (!pool) {
+      await resolveWorkerUrl();
+      // Leave a core for the page itself, and keep it between 2 and 8 workers.
+      pool = new WorkerPool(Math.max(2, Math.min(8, (navigator.hardwareConcurrency || 4) - 1)));
+    }
+    return pool;
+  }
 
-  // ------------------------------- Optimizer ---------------------------------
-  // Redistribute talent points (cost 1) and attribute points (weighted cost),
-  // conserving each budget, maximising lootPerMin. Steepest-ascent hill-climb
-  // with swap moves; deterministic seed => stable comparisons.
+  // Failed evaluations score -1 so they never win.
+  const scoreOf = (result) => (typeof result?.lootPerMin === 'number' ? result.lootPerMin : -1);
+
+  function withIterations(ctx, hunterId, iters) {
+    const copy = clone(ctx);
+    copy.hunterIterations = { ...copy.hunterIterations, [hunterId]: iters };
+    return copy;
+  }
+
+  // ---- Optimizer ----
+  // A "state" is { tv, av, score }: talent and attribute point arrays (in DATA
+  // order) plus the score for that combination. States and their arrays are
+  // never changed after they're made, so they can be shared without copying.
+  //
+  // Evaluations are slow (over a second each) and only scale so far across
+  // workers, so the search sends them out a pool-sized batch at a time.
   async function optimize(hunterId, build, opts, onProgress) {
-    const pool = opts.pool;
-    const searchCtx = JSON.parse(JSON.stringify(opts.ctx));
-    searchCtx.hunterIterations = Object.assign({}, searchCtx.hunterIterations, { [hunterId]: opts.searchIters });
+    const { pool } = opts;
+    const searchCtx = withIterations(opts.ctx, hunterId, opts.searchIters);
+    const finalCtx = withIterations(opts.ctx, hunterId, opts.finalIters);
 
-    const talents = DATA[hunterId].talents.map(([k, m]) => ({ k, max: m }));
-    const attrs = DATA[hunterId].attrs.map(([k, m, c]) => ({ k, max: m, cost: c }));
-
-    // Effective caps: never below what the account already reached anywhere.
+    // Start from the game's default caps, but raise them to whatever this
+    // account has already reached in any build.
     const allBuilds = buildsFor(hunterId);
-    const observed = (field, key) => Math.max(0, ...allBuilds.map(b => (b[field] && +b[field][key]) || 0));
-    talents.forEach(t => { t.eff = Math.max(t.max, (+build.talents?.[t.k]||0), observed('talents', t.k)); });
-    attrs.forEach(a => { a.eff = Math.max(a.max, (+build.attributes?.[a.k]||0), observed('attributes', a.k)); });
+    const highestSeen = (field, key) => Math.max(0, ...allBuilds.map((b) => pointsIn(b[field], key)));
+    const talents = DATA[hunterId].talents.map(([key, cap]) => ({
+      key, cap: Math.max(cap, pointsIn(build.talents, key), highestSeen('talents', key)),
+    }));
+    const attrs = DATA[hunterId].attrs.map(([key, cap, cost]) => ({
+      key, cost, cap: Math.max(cap, pointsIn(build.attributes, key), highestSeen('attributes', key)),
+    }));
 
-    // Ultima ("The Legacy of Ultima") is a level-gated advanced talent: it only
-    // unlocks once the hunter reaches level 70 (shouldShowAdvancedTalents). If it's
-    // not unlocked, cap it at the build's current value so the optimizer can never
-    // add points to it (which would be an impossible build).
-    const advUnlocked = (() => {
-      try { const { hunter } = stores();
-        if (typeof hunter.shouldShowAdvancedTalents === 'function') return !!hunter.shouldShowAdvancedTalents(hunterId);
-        const s = hunter.hunterLevelSettings && hunter.hunterLevelSettings[hunterId];
-        return !!(s && s.showAdvancedTalents);
-      } catch (e) { return true; }
-    })();
-    if (!advUnlocked) { const u = talents.find(t => t.k === 'ultima'); if (u) u.eff = (+build.talents?.ultima || 0); }
+    // Below level 70, Ultima stays exactly where it is. Adding points to it
+    // would give a build the player can't actually make.
+    if (!advancedTalentsUnlocked(hunterId)) {
+      const ultima = talents.find((t) => t.key === 'ultima');
+      if (ultima) ultima.cap = pointsIn(build.talents, 'ultima');
+    }
 
-    // Current allocation vectors + budgets.
-    let tv = talents.map(t => +build.talents?.[t.k] || 0);
-    let av = attrs.map(a => +build.attributes?.[a.k] || 0);
-    const tBudget = tv.reduce((s, x) => s + x, 0);
-    const attrTotal = (v) => v.reduce((s, x, i) => s + x * attrs[i].cost, 0);
-    const aBudget = attrTotal(av);
+    const start = {
+      tv: talents.map((t) => pointsIn(build.talents, t.key)),
+      av: attrs.map((a) => pointsIn(build.attributes, a.key)),
+    };
+    const talentBudget = start.tv.reduce((sum, x) => sum + x, 0);
+    const attrBudget = start.av.reduce((sum, x, i) => sum + x * attrs[i].cost, 0);
 
-    // Attribute prerequisite validity: every attr with points must have all its
-    // dependency parents >=1 and enough total points spent to have unlocked it.
-    const aIdx = {}; attrs.forEach((a, i) => { aIdx[a.k] = i; });
-    const deps = DEPS[hunterId] || {}, minval = MINVAL[hunterId] || {};
-    function attrValid(v) {
+    const attrIndex = Object.fromEntries(attrs.map((a, i) => [a.key, i]));
+    const requires = REQUIRES[hunterId] || {};
+    const unlockAt = UNLOCK_AT[hunterId] || {};
+
+    // Could a player actually reach this attribute allocation? Each attribute
+    // has to stay under its cap and have its parents at 1 or more. The unlock
+    // threshold is trickier. It counts the points already spent when an
+    // attribute gets its first point, so an attribute can't count its own
+    // points toward its own unlock. To check, we fill attributes in order of
+    // their threshold and make sure the ones before cover each threshold.
+    function attrsValid(av) {
       const active = [];
-      for (let i = 0; i < v.length; i++) if (v[i] > 0) {
-        if (v[i] > attrs[i].eff) return false;
-        const ps = deps[attrs[i].k];
-        if (ps) for (const p of ps) { const pi = aIdx[p]; if (pi == null || v[pi] < 1) return false; }
+      for (let i = 0; i < av.length; i++) {
+        if (av[i] <= 0) continue;
+        if (av[i] > attrs[i].cap) return false;
+        for (const parent of requires[attrs[i].key] || []) {
+          const p = attrIndex[parent];
+          if (p == null || av[p] < 1) return false;
+        }
         active.push(i);
       }
-      // Sequencing check: an attribute's min-value gate must be met by points
-      // ALREADY invested when its first point is placed — not by the final total
-      // (which would let an attribute count its own points toward its own gate).
-      // Pour points in ascending min-value order; before opening each attribute,
-      // the points spent so far must reach its threshold.
-      active.sort((a, b) => (minval[attrs[a].k] || 0) - (minval[attrs[b].k] || 0));
+      const threshold = (i) => unlockAt[attrs[i].key] || 0;
+      active.sort((a, b) => threshold(a) - threshold(b));
       let spent = 0;
       for (const i of active) {
-        if (spent < (minval[attrs[i].k] || 0)) return false;
-        spent += v[i] * attrs[i].cost;
+        if (spent < threshold(i)) return false;
+        spent += av[i] * attrs[i].cost;
       }
       return true;
     }
-    const gcd = (a, b) => b ? gcd(b, a % b) : a;
 
-    // Candidate builder: apply talent/attr vectors onto a copy of the build.
-    function makeBuild(tvec, avec) {
-      const b = JSON.parse(JSON.stringify(build));
-      b.talents = Object.assign({}, b.talents);
-      b.attributes = Object.assign({}, b.attributes);
-      talents.forEach((t, i) => { b.talents[t.k] = tvec[i]; });
-      attrs.forEach((a, i) => { b.attributes[a.k] = avec[i]; });
-      // Overrides can pin talent/attr values; strip those so our changes apply.
-      if (b.overrides) { const o = Object.assign({}, b.overrides);
-        talents.forEach(t => delete o[t.k]); attrs.forEach(a => delete o[a.k]); b.overrides = o; }
+    // Copy the build with our point arrays applied. Overrides can pin talent
+    // and attribute values, so drop those or our changes wouldn't take effect.
+    function makeBuild(tv, av) {
+      const b = clone(build);
+      b.talents = { ...b.talents };
+      b.attributes = { ...b.attributes };
+      talents.forEach((t, i) => { b.talents[t.key] = tv[i]; });
+      attrs.forEach((a, i) => { b.attributes[a.key] = av[i]; });
+      if (b.overrides) for (const { key } of [...talents, ...attrs]) delete b.overrides[key];
       return b;
     }
-    const evalVec = async (tvec, avec) => scoreOf(await pool.evaluate(hunterId, makeBuild(tvec, avec), searchCtx));
 
-    let evals = 0, best = { tv: tv.slice(), av: av.slice(), score: await evalVec(tv, av) };
-    const baselineSearchScore = best.score; evals++;
-    onProgress && onProgress({ phase: 'baseline', score: best.score, evals });
+    let evals = 0;
+    const evaluate = async (s) => {
+      evals++;
+      return scoreOf(await pool.evaluate(hunterId, makeBuild(s.tv, s.av), searchCtx));
+    };
 
-    // Talent transfer moves (A->B): -1 A, +1 B ; budget preserved.
-    function talentMoves(v) {
+    // Talent move: take one point from one talent and give it to another.
+    function talentMoves(tv) {
       const out = [];
-      for (let a = 0; a < v.length; a++) if (v[a] > 0)
-        for (let b = 0; b < v.length; b++) if (a !== b && v[b] < talents[b].eff) {
-          const nv = v.slice(); nv[a]--; nv[b]++; out.push(nv);
+      for (let a = 0; a < tv.length; a++) {
+        if (tv[a] <= 0) continue;
+        for (let b = 0; b < tv.length; b++) {
+          if (a === b || tv[b] >= talents[b].cap) continue;
+          const next = tv.slice();
+          next[a]--;
+          next[b]++;
+          out.push(next);
         }
+      }
       return out;
     }
-    // Attribute moves: cost-NEUTRAL swaps (remove dA from A, add dB to B with
-    // dA*costA == dB*costB) so the total point spend is conserved exactly.
-    // Only allocations that satisfy the prerequisite tree are emitted.
-    function attrMoves(v) {
+
+    // Attribute move: swap points between two attributes so the total cost
+    // stays the same, e.g. 3 points at cost 2 for 2 points at cost 3. We try
+    // the smallest such swap and double it, and skip any result the attribute
+    // tree wouldn't allow.
+    function attrMoves(av) {
       const out = [];
-      for (let a = 0; a < v.length; a++) if (v[a] > 0)
-        for (let b = 0; b < v.length; b++) if (a !== b && v[b] < attrs[b].eff) {
-          const ca = attrs[a].cost, cb = attrs[b].cost, g = ca * cb / gcd(ca, cb);
-          const dA = g / ca, dB = g / cb;
+      for (let a = 0; a < av.length; a++) {
+        if (av[a] <= 0) continue;
+        for (let b = 0; b < av.length; b++) {
+          if (a === b || av[b] >= attrs[b].cap) continue;
+          const unit = lcm(attrs[a].cost, attrs[b].cost);
           for (let mult = 1; mult <= 2; mult++) {
-            const da = dA * mult, db = dB * mult;
-            if (v[a] - da < 0 || v[b] + db > attrs[b].eff) break;
-            const nv = v.slice(); nv[a] -= da; nv[b] += db;
-            if (attrValid(nv)) out.push(nv);
+            const take = unit / attrs[a].cost * mult;
+            const give = unit / attrs[b].cost * mult;
+            if (av[a] - take < 0 || av[b] + give > attrs[b].cap) break;
+            const next = av.slice();
+            next[a] -= take;
+            next[b] += give;
+            if (attrsValid(next)) out.push(next);
           }
         }
+      }
       return out;
     }
 
-    // Evaluations are expensive (~1.4s each) and only scale ~2-3x across workers,
-    // so instead of scoring whole neighbourhoods we run pool-saturating "waves":
-    // each wave scores a small shuffled batch in parallel, takes the best
-    // improving move, and perturbs off the best when stuck. Clock checked per batch.
-    const MARGIN = 1 + (opts.margin || 0);
-    const POOL_N = (pool.workers && pool.workers.length) || 4;
-    const rand = (n) => (Math.random() * n) | 0;
-    const timeMs = opts.timeMs || 90000;
-    const patience = opts.patience == null ? 4 : opts.patience;
-    const t0 = performance.now();
-    const timeLeft = () => performance.now() - t0 < timeMs;
-    const stopped = () => !!(opts.shouldStop && opts.shouldStop());
-    const progress = () => onProgress && onProgress({ phase: 'search', score: best.score, evals, elapsed: (performance.now() - t0) / 1000 });
+    // Every legal single move from a state, talent moves first.
+    const neighbours = (s) => [
+      ...talentMoves(s.tv).map((tv) => ({ tv, av: s.av })),
+      ...attrMoves(s.av).map((av) => ({ tv: s.tv, av })),
+    ];
 
-    // Evaluate the full legal neighbourhood of (tv,av) in parallel batches and
-    // return the single best improving move (or null). Shared by Thorough mode and
-    // the Exploratory polish.
-    async function steepestPass(tv, av, curScore) {
-      const cands = [];
-      for (const m of talentMoves(tv)) cands.push({ k: 't', m });
-      for (const m of attrMoves(av)) cands.push({ k: 'a', m });
-      if (!cands.length) return null;
-      let bestMove = null;
-      for (let i = 0; i < cands.length && timeLeft() && !stopped();) {
-        const batch = cands.slice(i, i + POOL_N); i += batch.length;
-        const scored = await Promise.all(batch.map(async c => ({
-          c, s: c.k === 't' ? await evalVec(c.m, av) : await evalVec(tv, c.m),
-        })));
-        evals += batch.length;
-        for (const r of scored) if (r.s > curScore * MARGIN && (!bestMove || r.s > bestMove.s)) bestMove = r;
+    let best = { ...start, score: await evaluate(start) };
+    onProgress?.({ phase: 'baseline', score: best.score, evals });
+
+    const margin = 1 + (opts.margin || 0);
+    const poolSize = pool.size || 4;
+    const timeLimitMs = opts.timeMs || 90000;
+    const patience = opts.patience ?? 4;
+    const t0 = performance.now();
+    const keepGoing = () => performance.now() - t0 < timeLimitMs && !opts.shouldStop?.();
+    const progress = () => onProgress?.({ phase: 'search', score: best.score, evals, elapsed: (performance.now() - t0) / 1000 });
+
+    // To count as better, a score has to beat the reference by the margin.
+    // That keeps the search from chasing simulation noise. The plain `s > ref`
+    // check is for negative scores: there, ref * margin is less than ref, so one
+    // failed evaluation (-1) would otherwise "beat" another and the search could
+    // wander forever.
+    const beats = (s, ref) => s > ref && s > ref * margin;
+
+    function record(s) {
+      if (s.score <= best.score) return false;
+      best = s;
+      return true;
+    }
+
+    // Score candidates a batch at a time and return the best one that beats
+    // `ref`, or null. Stops early if time runs out, after `limit` candidates,
+    // or (with firstHit) as soon as a batch turns up any improvement at all.
+    async function findImprovement(cands, ref, { limit = cands.length, firstHit = false } = {}) {
+      let found = null;
+      for (let i = 0; i < limit && !(firstHit && found) && keepGoing();) {
+        const batch = cands.slice(i, i + poolSize);
+        i += batch.length;
+        const scores = await Promise.all(batch.map((s) => evaluate(s)));
+        batch.forEach((s, j) => {
+          if (beats(scores[j], ref) && (!found || scores[j] > found.score)) found = { ...s, score: scores[j] };
+        });
         progress();
       }
-      if (!bestMove) return null;
-      return bestMove.c.k === 't' ? { tv: bestMove.c.m, av, score: bestMove.s } : { tv, av: bestMove.c.m, score: bestMove.s };
+      return found;
+    }
+
+    // Steepest ascent from the best state: keep taking the single best move
+    // until a full scan finds nothing better, or we've taken maxSteps.
+    async function climb(maxSteps = Infinity) {
+      let cur = best;
+      for (let step = 0; step < maxSteps && keepGoing(); step++) {
+        const next = await findImprovement(neighbours(cur), cur.score);
+        if (!next) break;
+        cur = next;
+        record(cur);
+      }
     }
 
     const mode = opts.mode || 'balanced';
 
     if (mode === 'thorough') {
-      // Deterministic steepest descent: take the single best legal move each pass
-      // until a full neighbourhood scan finds no improvement.
-      let st = { tv: best.tv.slice(), av: best.av.slice(), score: best.score };
-      while (timeLeft() && !stopped()) {
-        const nx = await steepestPass(st.tv, st.av, st.score);
-        if (!nx) break;
-        st = nx;
-        if (st.score > best.score) best = { tv: st.tv.slice(), av: st.av.slice(), score: st.score };
-      }
+      await climb();
     } else if (mode === 'exploratory') {
-      // Simulated annealing over random single moves; occasionally accepts a worse
-      // build with probability exp(Δrel / T), T cooling to 0 (Heat = initial T).
-      // Sims are floored high upstream so accept/reject isn't chasing MC noise.
+      // Simulated annealing. Try a random move. Keep it if it's better, and
+      // sometimes keep it even when it's worse, with probability exp(change / T).
+      // T starts at Heat (0-100 maps to a 0-5% relative change) and cools to
+      // zero, so the search roams early and settles later. Then a short
+      // steepest-ascent polish from the best build it found. The UI raises the
+      // sim count for this mode so keep/reject isn't decided by noise.
       const samples = Math.max(50, opts.samples || 400);
-      const heat0 = Math.max(0, opts.heat == null ? 50 : opts.heat) / 100 * 0.05; // initial relative temperature
-      let curT = { tv: best.tv.slice(), av: best.av.slice(), score: best.score };
-      for (let step = 0; step < samples && timeLeft() && !stopped(); step++) {
-        const T = heat0 * (1 - step / samples);
+      const startTemp = Math.max(0, opts.heat ?? 50) / 100 * 0.05;
+      let cur = best;
+      for (let step = 0; step < samples && keepGoing(); step++) {
+        const temp = startTemp * (1 - step / samples);
         const useTalent = Math.random() < 0.5;
-        const moves = useTalent ? talentMoves(curT.tv) : attrMoves(curT.av);
+        const moves = useTalent ? talentMoves(cur.tv) : attrMoves(cur.av);
         if (!moves.length) continue;
-        const m = moves[rand(moves.length)];
-        const nt = useTalent ? m : curT.tv, na = useTalent ? curT.av : m;
-        const sc = await evalVec(nt, na); evals++;
-        const dRel = curT.score > 0 ? (sc - curT.score) / curT.score : (sc - curT.score);
-        if (dRel >= 0 || (T > 0 && Math.random() < Math.exp(dRel / T))) {
-          curT = { tv: nt, av: na, score: sc };
-          if (sc > best.score) best = { tv: curT.tv.slice(), av: curT.av.slice(), score: sc };
+        const pick = moves[randInt(moves.length)];
+        const cand = useTalent ? { tv: pick, av: cur.av } : { tv: cur.tv, av: pick };
+        const score = await evaluate(cand);
+        const change = cur.score > 0 ? (score - cur.score) / cur.score : score - cur.score;
+        if (change >= 0 || (temp > 0 && Math.random() < Math.exp(change / temp))) {
+          cur = { ...cand, score };
+          record(cur);
         }
         if (step % 4 === 0) progress();
       }
-      // Greedy polish from the best basin the annealing landed in.
-      let st = { tv: best.tv.slice(), av: best.av.slice(), score: best.score };
-      for (let p = 0; p < 5 && timeLeft() && !stopped(); p++) {
-        const nx = await steepestPass(st.tv, st.av, st.score);
-        if (!nx) break;
-        st = nx;
-        if (st.score > best.score) best = { tv: st.tv.slice(), av: st.av.slice(), score: st.score };
-      }
+      await climb(5);
     } else {
-      // Balanced (default): pool-saturating stochastic hill-climb with perturbation
-      // restarts. Termination is tracked against the GLOBAL best, counting whole
-      // restart cycles (climb → stall → perturb) that fail to beat it — so after
-      // `patience` fruitless restarts it always terminates (unlimited time = run to
-      // convergence, never an infinite loop).
-      let cur = { tv: best.tv.slice(), av: best.av.slice(), score: best.score };
-      let failedRestarts = 0, improvedBestSincePerturb = false;
-      while (timeLeft() && failedRestarts <= patience && !stopped()) {
-        const cands = [];
-        for (const m of talentMoves(cur.tv)) cands.push({ k: 't', m });
-        for (const m of attrMoves(cur.av)) cands.push({ k: 'a', m });
+      // Balanced, the default: a randomised hill-climb. Each round shuffles
+      // the neighbours, scores a capped number of them, and takes the best
+      // improvement from the first batch that has one. When a round finds
+      // nothing, jump back to the best build so far, nudge it with a few random
+      // moves and keep climbing. It stops after `patience` restarts in a row
+      // fail to beat the best, so even an unlimited run finishes.
+      let cur = best;
+      let failedRestarts = 0;
+      let improvedSinceRestart = false;
+      while (failedRestarts <= patience && keepGoing()) {
+        const cands = neighbours(cur);
         if (!cands.length) break;
-        for (let i = cands.length - 1; i > 0; i--) { const j = rand(i + 1); const t = cands[i]; cands[i] = cands[j]; cands[j] = t; }
-        const capPerWave = Math.min(cands.length, Math.max(POOL_N * 4, 24));
-        let improved = null;
-        for (let i = 0; i < capPerWave && !improved && timeLeft() && !stopped();) {
-          const batch = cands.slice(i, i + POOL_N); i += batch.length;
-          const scored = await Promise.all(batch.map(async c => ({
-            c, s: c.k === 't' ? await evalVec(c.m, cur.av) : await evalVec(cur.tv, c.m),
-          })));
-          evals += batch.length;
-          for (const r of scored) if (r.s > cur.score * MARGIN && (!improved || r.s > improved.s)) improved = r;
-          progress();
-        }
-        if (improved) {
-          cur = improved.c.k === 't'
-            ? { tv: improved.c.m, av: cur.av, score: improved.s }
-            : { tv: cur.tv, av: improved.c.m, score: improved.s };
-          if (cur.score > best.score) { best = { tv: cur.tv.slice(), av: cur.av.slice(), score: cur.score }; improvedBestSincePerturb = true; }
+        shuffle(cands);
+        const limit = Math.min(cands.length, Math.max(poolSize * 4, 24));
+        const next = await findImprovement(cands, cur.score, { limit, firstHit: true });
+        if (next) {
+          cur = next;
+          if (record(cur)) improvedSinceRestart = true;
         } else {
-          if (improvedBestSincePerturb) failedRestarts = 0; else failedRestarts++;
-          improvedBestSincePerturb = false;
-          cur = { tv: best.tv.slice(), av: best.av.slice(), score: best.score };
-          for (let k = 0; k < 3; k++) { const tm = talentMoves(cur.tv); if (tm.length) cur.tv = tm[rand(tm.length)]; }
-          for (let k = 0; k < 3; k++) { const am = attrMoves(cur.av); if (am.length) cur.av = am[rand(am.length)]; }
-          cur.score = await evalVec(cur.tv, cur.av); evals++;
+          failedRestarts = improvedSinceRestart ? 0 : failedRestarts + 1;
+          improvedSinceRestart = false;
+          let { tv, av } = best;
+          for (let k = 0; k < 3; k++) { const m = talentMoves(tv); if (m.length) tv = m[randInt(m.length)]; }
+          for (let k = 0; k < 3; k++) { const m = attrMoves(av); if (m.length) av = m[randInt(m.length)]; }
+          cur = { tv, av, score: await evaluate({ tv, av }) };
         }
       }
     }
 
-    // Final verification at full iterations: compare baseline vs best fairly.
-    // The search optimises a lower-iteration (noisier) estimate, so its winner
-    // can lose to the current build at full accuracy. If it doesn't actually
-    // beat the current build here, KEEP the current build (report it as best).
-    const finalCtx = JSON.parse(JSON.stringify(opts.ctx));
-    finalCtx.hunterIterations = Object.assign({}, finalCtx.hunterIterations, { [hunterId]: opts.finalIters });
-    const finalScore = async (b) => scoreOf(await pool.evaluate(hunterId, b, finalCtx));
-    const baseTv = talents.map(t => +build.talents?.[t.k] || 0);
-    const baseAv = attrs.map(a => +build.attributes?.[a.k] || 0);
-    const beforeFull = await finalScore(makeBuild(baseTv, baseAv));
-    let afterFull = await finalScore(makeBuild(best.tv, best.av));
-    if (afterFull <= beforeFull) { best = { tv: baseTv, av: baseAv, score: best.score }; afterFull = beforeFull; }
-
-    const talentAlloc = talents.map((t, i) => ({ key: t.k, label: LABELS[t.k] || t.k, from: +build.talents?.[t.k]||0, to: best.tv[i], max: t.eff }));
-    const attrAlloc = attrs.map((a, i) => ({ key: a.k, label: LABELS[a.k] || a.k, cost: a.cost, from: +build.attributes?.[a.k]||0, to: best.av[i], max: a.eff }));
+    // The search uses a quick, lower-resolution score, so its winner can turn
+    // out to be no better once we look closely. Score the starting build and
+    // the winner again at full resolution, and only suggest the change if it
+    // really is better. Otherwise we keep the current build.
+    const fullScore = async (s) => scoreOf(await pool.evaluate(hunterId, makeBuild(s.tv, s.av), finalCtx));
+    const beforeFull = await fullScore(start);
+    let afterFull = await fullScore(best);
+    let winner = best;
+    if (afterFull <= beforeFull) {
+      winner = start;
+      afterFull = beforeFull;
+    }
 
     return {
-      hunterId, build, talents: talentAlloc, attrs: attrAlloc,
-      tBudget, aBudget, evals,
-      beforeFull, afterFull,
+      hunterId,
+      build,
+      talents: talents.map((t, i) => ({ key: t.key, label: LABELS[t.key] || t.key, from: start.tv[i], to: winner.tv[i], cap: t.cap })),
+      attrs: attrs.map((a, i) => ({ key: a.key, label: LABELS[a.key] || a.key, cost: a.cost, from: start.av[i], to: winner.av[i], cap: a.cap })),
+      talentBudget,
+      attrBudget,
+      evals,
+      beforeFull,
+      afterFull,
       pctGain: beforeFull > 0 ? (afterFull / beforeFull - 1) * 100 : 0,
-      makeBuild, best,
+      optimizedBuild: () => makeBuild(winner.tv, winner.av),
     };
   }
 
-  // --------------------------------- UI --------------------------------------
-  const css = `
+  // ---- UI ----
+
+  const CSS = `
   #cifi-opt-fab{position:fixed;right:18px;bottom:18px;z-index:99999;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none;border-radius:999px;padding:11px 16px;font:600 14px/1 system-ui;box-shadow:0 6px 20px rgba(99,102,241,.45);cursor:pointer;display:flex;gap:7px;align-items:center}
   #cifi-opt-fab:hover{filter:brightness(1.08)}
   #cifi-opt-modal{position:fixed;inset:0;z-index:100000;background:rgba(2,6,23,.72);display:flex;align-items:center;justify-content:center;font-family:system-ui}
@@ -525,152 +700,192 @@
   table.cifi{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:8px}
   table.cifi th,table.cifi td{padding:5px 8px;text-align:left;border-bottom:1px solid #1e293b}
   table.cifi td.n{text-align:right;font-variant-numeric:tabular-nums}
-  .up{color:#22c55e}.down{color:#f87171}.same{color:#64748b}
+  .cifi-up{color:#22c55e}.cifi-down{color:#f87171}.cifi-same{color:#64748b}
   .cifi-kpi{display:flex;gap:18px;flex-wrap:wrap;margin:8px 0 4px}
   .cifi-kpi div b{display:block;font-size:19px}
   .cifi-cols{display:grid;grid-template-columns:1fr 1fr;gap:18px}
   @media(max-width:640px){.cifi-cols{grid-template-columns:1fr}}`;
 
-  function fmt(n) {
+  // Same suffixes as the site (qa = 1e15), so our numbers read like the app's.
+  const SUFFIXES = ['', 'k', 'm', 'b', 't', 'qa', 'qu', 'sx', 'sp', 'o', 'n', 'd'];
+  function formatScore(n) {
     if (!isFinite(n)) return '—';
-    const u = [['qa',1e18],['t',1e12],['b',1e9],['m',1e6],['k',1e3]];
-    for (const [s, v] of u) if (Math.abs(n) >= v) return (n / v).toFixed(2) + s;
-    return n.toFixed(2);
+    const tier = Math.max(0, Math.min(SUFFIXES.length - 1, Math.floor(Math.log10(Math.abs(n)) / 3)));
+    return (n / 1000 ** tier).toFixed(2) + SUFFIXES[tier];
   }
 
-  let pool = null;
-  async function ensurePool() {
-    if (pool) return pool;
-    await resolveWorkerUrl();
-    const n = Math.max(2, Math.min(8, (navigator.hardwareConcurrency || 4) - 1));
-    pool = new Pool(n);
-    return pool;
+  const DEFAULTS = { searchIters: 1200, finalIters: 10000, maxSeconds: 75, heat: 50, samples: 400 };
+
+  const MODE_HELP = {
+    balanced: 'Balanced: a quick randomised search that climbs from the best build so far and restarts when it gets stuck. A good default.',
+    thorough: 'Thorough: tries every legal move on each pass and takes the best, until nothing helps. Slower, but squeezes the most out of a solid build.',
+    exploratory: 'Exploratory: early on it sometimes accepts a worse build (more often with higher Heat) to escape a dead end. Runs more sims per check so the choices are stable.',
+  };
+
+  // Builds are grouped into categories: active, archived, and any the player
+  // made. Use the store's helpers when it has them, otherwise read its data.
+  function buildCategory(hunter, hunterId, build) {
+    try {
+      const fromStore = typeof hunter.getBuildCategory === 'function' && hunter.getBuildCategory(hunterId, build.id);
+      if (fromStore) return fromStore;
+      const mapped = hunter.buildCategories?.[hunterId]?.buildCategoryMap?.[build.id];
+      if (mapped) return mapped;
+    } catch (e) { /* fall back to the archived flag */ }
+    return build.isArchived ? 'archived' : 'active';
+  }
+
+  function categoryName(hunter, hunterId, catId) {
+    try {
+      const cats = (typeof hunter.getCategories === 'function' && hunter.getCategories(hunterId))
+        || hunter.buildCategories?.[hunterId]?.categories || [];
+      const cat = cats.find((c) => c.id === catId);
+      if (cat) return cat.name;
+    } catch (e) { /* fall back to the id */ }
+    return !catId || catId === 'active' ? 'Active' : catId;
   }
 
   function openModal() {
     let hunterIds;
-    try { const { hunter } = stores(); hunterIds = Object.keys(hunter.hunterBuilds || { borge: 1 }); }
-    catch (e) { alert('CIFI Optimizer: app not ready yet — open a hunter page first.'); return; }
-    hunterIds = ['borge', 'ozzy', 'knox'].filter(h => hunterIds.includes(h));
+    try {
+      const { hunter } = stores();
+      hunterIds = HUNTERS.filter((h) => !hunter.hunterBuilds || h in hunter.hunterBuilds);
+    } catch (e) {
+      alert("CIFI Optimizer: the app isn't ready yet. Open a hunter page first.");
+      return;
+    }
 
-    const wrap = document.createElement('div'); wrap.id = 'cifi-opt-modal';
+    const wrap = document.createElement('div');
+    wrap.id = 'cifi-opt-modal';
     wrap.innerHTML = `<div id="cifi-opt-card">
       <h2>🎯 Loot Score Optimizer <button class="cifi-x" id="cifi-close">×</button></h2>
       <div class="cifi-body">
         <div class="cifi-row">
-          <label class="cifi-field">Hunter<select id="cifi-hunter">${hunterIds.map(h=>`<option value="${h}">${h[0].toUpperCase()+h.slice(1)}</option>`).join('')}</select></label>
+          <label class="cifi-field">Hunter<select id="cifi-hunter">${hunterIds.map((h) => `<option value="${h}">${h[0].toUpperCase() + h.slice(1)}</option>`).join('')}</select></label>
           <label class="cifi-field">Build<select id="cifi-build" style="min-width:220px"></select></label>
           <label class="cifi-field" style="flex-direction:row;align-items:center;gap:6px;padding-bottom:9px"><input type="checkbox" id="cifi-hidearch" checked style="min-width:0">Hide archived</label>
           <label class="cifi-field">Mode<select id="cifi-mode" style="min-width:130px"><option value="balanced">Balanced</option><option value="thorough">Thorough</option><option value="exploratory">Exploratory</option></select></label>
-          <label class="cifi-field">Search iters<input id="cifi-si" type="number" value="1200" min="200" step="100" style="width:90px"></label>
-          <label class="cifi-field">Final iters<input id="cifi-fi" type="number" value="10000" min="1000" step="1000" style="width:90px"></label>
-          <label class="cifi-field">Max time (s, 0=∞)<input id="cifi-tm" type="number" value="75" min="0" step="15" style="width:80px"></label>
-          <label class="cifi-field cifi-explor" style="display:none">Heat<input id="cifi-heat" type="number" value="50" min="0" max="100" step="5" style="width:70px"></label>
-          <label class="cifi-field cifi-explor" style="display:none">Samples<input id="cifi-samples" type="number" value="400" min="50" step="50" style="width:80px"></label>
+          <label class="cifi-field">Search iters<input id="cifi-si" type="number" value="${DEFAULTS.searchIters}" min="200" step="100" style="width:90px"></label>
+          <label class="cifi-field">Final iters<input id="cifi-fi" type="number" value="${DEFAULTS.finalIters}" min="1000" step="1000" style="width:90px"></label>
+          <label class="cifi-field">Max time (s, 0=∞)<input id="cifi-tm" type="number" value="${DEFAULTS.maxSeconds}" min="0" step="15" style="width:80px"></label>
+          <label class="cifi-field cifi-explor" style="display:none">Heat<input id="cifi-heat" type="number" value="${DEFAULTS.heat}" min="0" max="100" step="5" style="width:70px"></label>
+          <label class="cifi-field cifi-explor" style="display:none">Samples<input id="cifi-samples" type="number" value="${DEFAULTS.samples}" min="50" step="50" style="width:80px"></label>
           <button class="cifi-btn" id="cifi-run">Optimize</button>
         </div>
-        <div id="cifi-status" class="cifi-muted">Redistributes this build's talent &amp; attribute points for maximum Loot Score. Current build stays feasible, so it can only match or beat it.</div>
+        <div id="cifi-status" class="cifi-muted"></div>
         <div class="cifi-prog"><div id="cifi-bar"></div></div>
         <div id="cifi-out"></div>
       </div></div>`;
     document.body.appendChild(wrap);
-    const $ = (id) => wrap.querySelector(id);
+
+    const $ = (sel) => wrap.querySelector(sel);
     const close = () => wrap.remove();
     $('#cifi-close').onclick = close;
     wrap.onclick = (e) => { if (e.target === wrap) close(); };
 
-    function categoryOf(h, b) {
-      try { const { hunter } = stores();
-        if (typeof hunter.getBuildCategory === 'function') { const c = hunter.getBuildCategory(h, b.id); if (c) return c; }
-        const bc = hunter.buildCategories && hunter.buildCategories[h];
-        return (bc && bc.buildCategoryMap && bc.buildCategoryMap[b.id]) || (b.isArchived ? 'archived' : 'active');
-      } catch (e) { return b.isArchived ? 'archived' : 'active'; }
-    }
-    function categoryName(h, catId) {
-      try { const { hunter } = stores();
-        const cats = (typeof hunter.getCategories === 'function' ? hunter.getCategories(h) : null)
-          || (hunter.buildCategories && hunter.buildCategories[h] && hunter.buildCategories[h].categories) || [];
-        const c = cats.find(c => c.id === catId); return c ? c.name : (catId === 'active' ? 'Active' : catId || 'Active');
-      } catch (e) { return catId || 'Active'; }
-    }
+    // An empty or non-numeric box falls back to the default. A real 0 is kept
+    // (Heat 0 is a valid choice).
+    const numberFrom = (sel, fallback) => {
+      const v = parseFloat($(sel).value);
+      return Number.isFinite(v) ? v : fallback;
+    };
+
+    let builds = [];
     function fillBuilds() {
-      const h = $('#cifi-hunter').value;
-      const hideArch = $('#cifi-hidearch').checked;
-      const full = buildsFor(h);
-      const rows = full.map((b, i) => ({ b, i, cat: categoryOf(h, b) })).filter(x => !hideArch || x.cat !== 'archived');
+      const hunterId = $('#cifi-hunter').value;
+      const hideArchived = $('#cifi-hidearch').checked;
+      const { hunter } = stores();
+      builds = buildsFor(hunterId);
+
       const groups = {};
-      for (const x of rows) (groups[x.cat] = groups[x.cat] || []).push(x);
-      const rank = (c) => c === 'active' ? 0 : c === 'archived' ? 2 : 1; // active first, archived last
-      const order = Object.keys(groups).sort((a, b) => rank(a) - rank(b) || categoryName(h, a).localeCompare(categoryName(h, b)));
-      $('#cifi-build').innerHTML = order.map(cat =>
-        `<optgroup label="${categoryName(h, cat)}">` +
-        groups[cat].map(x => `<option value="${x.i}">${(x.b.name || 'Unnamed')} — Lv${x.b.level || '?'}</option>`).join('') +
-        `</optgroup>`).join('') || '<option disabled>(no builds)</option>';
-      $('#cifi-build').__list = full;
+      builds.forEach((b, i) => {
+        const cat = buildCategory(hunter, hunterId, b);
+        if (hideArchived && cat === 'archived') return;
+        (groups[cat] = groups[cat] || []).push(`<option value="${i}">${escapeHtml(b.name || 'Unnamed')} — Lv${escapeHtml(b.level || '?')}</option>`);
+      });
+
+      // Active first, archived last, anything else alphabetically in between.
+      const rank = (c) => (c === 'active' ? 0 : c === 'archived' ? 2 : 1);
+      const name = (c) => categoryName(hunter, hunterId, c);
+      const order = Object.keys(groups).sort((a, b) => rank(a) - rank(b) || name(a).localeCompare(name(b)));
+      $('#cifi-build').innerHTML = order
+        .map((cat) => `<optgroup label="${escapeHtml(name(cat))}">${groups[cat].join('')}</optgroup>`)
+        .join('') || '<option disabled>(no builds)</option>';
     }
+
+    function applyMode() {
+      const mode = $('#cifi-mode').value;
+      wrap.querySelectorAll('.cifi-explor').forEach((el) => { el.style.display = mode === 'exploratory' ? '' : 'none'; });
+      $('#cifi-status').textContent = MODE_HELP[mode] || '';
+    }
+
     $('#cifi-hunter').onchange = fillBuilds;
     $('#cifi-hidearch').onchange = fillBuilds;
-    const MODE_DESC = {
-      balanced: 'Balanced — fast stochastic search: climbs from the best, restarts when stuck. Good default for most builds.',
-      thorough: 'Thorough — deterministic steepest descent: tries every legal move each pass until nothing improves. Best for squeezing a solid build.',
-      exploratory: 'Exploratory — simulated annealing: sometimes accepts worse builds early (Heat) to escape stuck results. Sims are raised for stable decisions.',
-    };
-    function applyMode() {
-      const m = $('#cifi-mode').value;
-      wrap.querySelectorAll('.cifi-explor').forEach(el => { el.style.display = m === 'exploratory' ? '' : 'none'; });
-      $('#cifi-status').textContent = MODE_DESC[m] || '';
-    }
     $('#cifi-mode').onchange = applyMode;
-    // Default to whichever hunter page is currently open.
-    const curHunter = (location.pathname.match(/\/(borge|ozzy|knox)(?:\/|$)/) || [])[1];
-    if (curHunter && hunterIds.includes(curHunter)) $('#cifi-hunter').value = curHunter;
+
+    // Start on whichever hunter's page is open.
+    const pageHunter = location.pathname.match(/\/(borge|ozzy|knox)(?:\/|$)/)?.[1];
+    if (pageHunter && hunterIds.includes(pageHunter)) $('#cifi-hunter').value = pageHunter;
     fillBuilds();
     applyMode();
 
     const runBtn = $('#cifi-run');
     async function startRun() {
-      const h = $('#cifi-hunter').value;
-      const list = $('#cifi-build').__list || buildsFor(h);
-      const build = list[+$('#cifi-build').value];
+      const hunterId = $('#cifi-hunter').value;
+      const build = builds[+$('#cifi-build').value];
       if (!build) return;
+
       const mode = $('#cifi-mode').value || 'balanced';
-      let searchIters = Math.max(200, +$('#cifi-si').value || 1200);
-      const finalIters = Math.max(1000, +$('#cifi-fi').value || 10000);
-      const tmSec = Math.max(0, +$('#cifi-tm').value || 0);
-      const timeMs = tmSec > 0 ? tmSec * 1000 : Infinity; // 0 = unlimited (run to convergence)
-      const heat = Math.max(0, Math.min(100, +$('#cifi-heat').value || 50));
-      const samples = Math.max(50, +$('#cifi-samples').value || 400);
-      // Exploratory's accept/reject is noise-sensitive, so floor the sim count.
+      let searchIters = Math.max(200, numberFrom('#cifi-si', DEFAULTS.searchIters));
+      const finalIters = Math.max(1000, numberFrom('#cifi-fi', DEFAULTS.finalIters));
+      const maxSeconds = Math.max(0, numberFrom('#cifi-tm', 0));
+      const heat = Math.max(0, Math.min(100, numberFrom('#cifi-heat', DEFAULTS.heat)));
+      const samples = Math.max(50, numberFrom('#cifi-samples', DEFAULTS.samples));
+      // Annealing compares one noisy score against another, so it needs more sims to be reliable.
       if (mode === 'exploratory') searchIters = Math.max(searchIters, 3000);
-      let stopFlag = false;
+
+      // While the run is going, the Optimize button becomes a Stop button.
+      let stopRequested = false;
+      runBtn.textContent = '⏹ Stop';
+      runBtn.disabled = false;
+      runBtn.onclick = () => {
+        stopRequested = true;
+        runBtn.textContent = 'Stopping…';
+        runBtn.disabled = true;
+        $('#cifi-status').textContent = 'Stopping, will show the best build found so far…';
+      };
       $('#cifi-out').innerHTML = '';
       $('#cifi-status').textContent = 'Warming up engine…';
-      // Turn the button into a Stop control for the duration of the run.
-      runBtn.textContent = '⏹ Stop'; runBtn.disabled = false;
-      runBtn.onclick = () => {
-        stopFlag = true; runBtn.textContent = 'Stopping…'; runBtn.disabled = true;
-        $('#cifi-status').textContent = 'Stopping — reporting best found so far…';
-      };
+
       try {
-        const ctx = buildContext(h);
         const t0 = performance.now();
-        const res = await optimize(h, build, {
-          pool: await ensurePool(), ctx, searchIters, finalIters, timeMs,
-          margin: 0.0005, patience: 4, shouldStop: () => stopFlag,
-          mode, heat, samples,
+        const result = await optimize(hunterId, build, {
+          pool: await getPool(),
+          ctx: appContext(),
+          searchIters,
+          finalIters,
+          timeMs: maxSeconds > 0 ? maxSeconds * 1000 : Infinity, // 0 means run until it converges
+          margin: 0.0005,
+          patience: 4,
+          shouldStop: () => stopRequested,
+          mode,
+          heat,
+          samples,
         }, (p) => {
-          const pct = Math.min(98, (p.evals / Math.max(1, (p.evals + 40))) * 100);
-          $('#cifi-bar').style.width = pct + '%';
+          // We can't know how long a run will take, so the bar just creeps
+          // toward 98% as the evaluation count climbs.
+          $('#cifi-bar').style.width = Math.min(98, p.evals / (p.evals + 40) * 100) + '%';
           $('#cifi-status').textContent =
-            `${stopFlag ? 'Stopping' : 'Searching'}… ${p.evals} evals · best ${fmt(p.score)} · ${(p.elapsed||0).toFixed(0)}s`;
+            `${stopRequested ? 'Stopping' : 'Searching'}… ${p.evals} evals · best ${formatScore(p.score)} · ${(p.elapsed || 0).toFixed(0)}s`;
         });
         $('#cifi-bar').style.width = '100%';
-        renderResult($, res, (performance.now() - t0) / 1000);
+        renderResult($, result, (performance.now() - t0) / 1000);
       } catch (e) {
-        $('#cifi-status').textContent = 'Error: ' + (e && e.message || e);
-        console.error('[CIFI Optimizer]', e);
+        $('#cifi-status').textContent = 'Error: ' + (e?.message || e);
+        console.error(TAG, e);
       } finally {
-        runBtn.textContent = 'Optimize'; runBtn.disabled = false; runBtn.onclick = startRun;
+        runBtn.textContent = 'Optimize';
+        runBtn.disabled = false;
+        runBtn.onclick = startRun;
       }
     }
     runBtn.onclick = startRun;
@@ -678,75 +893,103 @@
 
   function renderResult($, res, secs) {
     const gain = res.pctGain;
-    const gcls = gain > 0.05 ? 'up' : (gain < -0.05 ? 'down' : 'same');
+    const gainClass = gain > 0.05 ? 'cifi-up' : gain < -0.05 ? 'cifi-down' : 'cifi-same';
     const rowHtml = (r) => {
       const d = r.to - r.from;
-      const cls = d > 0 ? 'up' : (d < 0 ? 'down' : 'same');
-      const arrow = d > 0 ? '▲' : (d < 0 ? '▼' : '');
-      return `<tr><td>${r.label}${r.cost?` <span class="cifi-muted">×${r.cost}</span>`:''}</td>
+      const cls = d > 0 ? 'cifi-up' : d < 0 ? 'cifi-down' : 'cifi-same';
+      const arrow = d > 0 ? '▲' : d < 0 ? '▼' : '';
+      return `<tr><td>${r.label}${r.cost ? ` <span class="cifi-muted">×${r.cost}</span>` : ''}</td>
         <td class="n">${r.from}</td><td class="n ${cls}">${arrow} ${r.to}</td>
-        <td class="n cifi-muted">${isFinite(r.max)?r.max:'∞'}</td></tr>`;
+        <td class="n cifi-muted">${isFinite(r.cap) ? r.cap : '∞'}</td></tr>`;
     };
-    const tRows = res.talents.map(rowHtml).join('');
-    const aRows = res.attrs.map(rowHtml).join('');
-    const changed = res.talents.concat(res.attrs).some(r => r.to !== r.from);
+    const changed = [...res.talents, ...res.attrs].some((r) => r.to !== r.from);
+
     $('#cifi-status').textContent =
-      `Done in ${secs.toFixed(0)}s · ${res.evals} evaluations · budgets: ${res.tBudget} talent pts, ${res.aBudget} attribute pts.`;
+      `Done in ${secs.toFixed(0)}s · ${res.evals} evaluations · budgets: ${res.talentBudget} talent pts, ${res.attrBudget} attribute pts.`;
     $('#cifi-out').innerHTML = `
       <div class="cifi-kpi">
-        <div><span class="cifi-muted">Current Loot Score</span><b>${fmt(res.beforeFull)}</b></div>
-        <div><span class="cifi-muted">Optimized Loot Score</span><b class="${gcls}">${fmt(res.afterFull)}</b></div>
-        <div><span class="cifi-muted">Change</span><b class="${gcls}">${gain>=0?'+':''}${gain.toFixed(2)}%</b></div>
+        <div><span class="cifi-muted">Current Loot Score</span><b>${formatScore(res.beforeFull)}</b></div>
+        <div><span class="cifi-muted">Optimized Loot Score</span><b class="${gainClass}">${formatScore(res.afterFull)}</b></div>
+        <div><span class="cifi-muted">Change</span><b class="${gainClass}">${gain >= 0 ? '+' : ''}${gain.toFixed(2)}%</b></div>
       </div>
-      ${changed ? '' : '<div class="cifi-muted" style="margin:6px 0">Your current allocation is already optimal (within engine noise) for this build.</div>'}
+      ${changed ? '' : '<div class="cifi-muted" style="margin:6px 0">Your current allocation is already the best we could find (within engine noise).</div>'}
       <div class="cifi-cols">
         <div><b>Talents</b> <span class="cifi-muted">(1 pt each)</span>
-          <table class="cifi"><tr><th>Talent</th><th class="n">Now</th><th class="n">Best</th><th class="n">Cap</th></tr>${tRows}</table></div>
+          <table class="cifi"><tr><th>Talent</th><th class="n">Now</th><th class="n">Best</th><th class="n">Cap</th></tr>${res.talents.map(rowHtml).join('')}</table></div>
         <div><b>Attributes</b> <span class="cifi-muted">(weighted cost)</span>
-          <table class="cifi"><tr><th>Attribute</th><th class="n">Now</th><th class="n">Best</th><th class="n">Cap</th></tr>${aRows}</table></div>
+          <table class="cifi"><tr><th>Attribute</th><th class="n">Now</th><th class="n">Best</th><th class="n">Cap</th></tr>${res.attrs.map(rowHtml).join('')}</table></div>
       </div>
       <div class="cifi-row" style="margin-top:16px">
-        <button class="cifi-btn" id="cifi-save" ${changed?'':'disabled'}>Save as new build</button>
+        <button class="cifi-btn" id="cifi-save" ${changed ? '' : 'disabled'}>Save as new build</button>
         <button class="cifi-btn secondary" id="cifi-copy">Copy build code</button>
       </div>
-      <div class="cifi-muted" style="margin-top:6px">Build code pastes straight into the game tool's <b>Import</b> (works on this device or the live site).</div>`;
+      <div class="cifi-muted" style="margin-top:6px">The build code pastes straight into the tool's <b>Import</b>, here or on the live site.</div>`;
 
-    $('#cifi-copy').onclick = async () => {
-      const nb = res.makeBuild(res.best.tv, res.best.av);
-      const code = generateBuildCode(nb, res.hunterId);
-      if (!code) { $('#cifi-copy').textContent = 'Code failed'; return; }
-      try { await navigator.clipboard.writeText(code); $('#cifi-copy').textContent = 'Copied code ✓'; }
-      catch (e) { window.prompt('Build code (copy):', code); $('#cifi-copy').textContent = 'Copy build code'; }
-      setTimeout(() => $('#cifi-copy').textContent = 'Copy build code', 1800);
+    const copyBtn = $('#cifi-copy');
+    copyBtn.onclick = async () => {
+      const code = generateBuildCode(res.optimizedBuild(), res.hunterId);
+      if (!code) { copyBtn.textContent = 'Code failed'; return; }
+      try {
+        await navigator.clipboard.writeText(code);
+        copyBtn.textContent = 'Copied code ✓';
+      } catch (e) {
+        // Clipboard access can be blocked, so show the code to copy by hand instead.
+        window.prompt('Build code (copy):', code);
+      }
+      setTimeout(() => { copyBtn.textContent = 'Copy build code'; }, 1800);
     };
+
     const saveBtn = $('#cifi-save');
-    if (saveBtn) saveBtn.onclick = () => {
+    saveBtn.onclick = () => {
       try {
         const { hunter } = stores();
-        const nb = res.makeBuild(res.best.tv, res.best.av);
-        nb.name = (res.build.name || 'Build') + ' (optimized)';
-        delete nb.id; delete nb.timestamp; nb.isImported = false;
+        const nb = res.optimizedBuild();
+        nb.name = `${res.build.name || 'Build'} (optimized)`;
+        delete nb.id;
+        delete nb.timestamp;
+        nb.isImported = false;
         if (typeof hunter.addBuild === 'function') hunter.addBuild(res.hunterId, nb);
-        else if (hunter.hunterBuilds && hunter.hunterBuilds[res.hunterId]) hunter.hunterBuilds[res.hunterId].push(nb);
-        saveBtn.textContent = 'Saved ✓ (see build list)'; saveBtn.disabled = true;
-      } catch (e) { alert('Save failed: ' + (e && e.message || e)); }
+        else if (hunter.hunterBuilds?.[res.hunterId]) hunter.hunterBuilds[res.hunterId].push(nb);
+        else throw new Error("couldn't find this hunter's build list");
+        saveBtn.textContent = 'Saved ✓ (see build list)';
+        saveBtn.disabled = true;
+      } catch (e) {
+        alert('Save failed: ' + (e?.message || e));
+      }
     };
   }
 
-  // ------------------------------- Bootstrap ---------------------------------
-  window.__cifiGenerateBuildCode = generateBuildCode; // exposed for verification/tools
-  function boot() {
+  // ---- Startup ----
+
+  window.__cifiGenerateBuildCode = generateBuildCode; // handy for checking codes from the console
+
+  function addButton() {
     if (document.getElementById('cifi-opt-fab')) return;
-    const style = document.createElement('style'); style.textContent = css; document.head.appendChild(style);
-    const fab = document.createElement('button'); fab.id = 'cifi-opt-fab';
-    fab.innerHTML = '🎯 Optimize'; fab.title = 'Auto-optimize a build for max Loot Score';
-    fab.onclick = openModal; document.body.appendChild(fab);
-    console.log('%c[CIFI Optimizer] 🎯 button added (bottom-right)', 'color:#22c55e;font-weight:bold');
+    const style = document.createElement('style');
+    style.textContent = CSS;
+    document.head.appendChild(style);
+
+    const fab = document.createElement('button');
+    fab.id = 'cifi-opt-fab';
+    fab.textContent = '🎯 Optimize';
+    fab.title = 'Auto-optimize a build for max Loot Score';
+    fab.onclick = openModal;
+    document.body.appendChild(fab);
+    console.log(`%c${TAG} 🎯 button added (bottom-right)`, 'color:#22c55e;font-weight:bold');
   }
-  // Wait until the Vue app + pinia are mounted.
-  let __booted = false;
-  const iv = setInterval(() => {
-    try { if (pinia() && pinia().get('hunter')) { clearInterval(iv); __booted = true; boot(); } } catch (e) {}
+
+  // This can run before Vue has mounted the app, so check every 400ms until the
+  // hunter store shows up, and give up after a minute.
+  let attempts = 0;
+  const poll = setInterval(() => {
+    let ready = false;
+    try { ready = !!piniaStores()?.get('hunter'); } catch (e) { /* not mounted yet */ }
+    if (ready) {
+      clearInterval(poll);
+      addButton();
+    } else if (++attempts >= 150) {
+      clearInterval(poll);
+      console.warn(`${TAG} gave up: couldn't find the app's hunter store after 60s`);
+    }
   }, 400);
-  setTimeout(() => { clearInterval(iv); if (!__booted) console.warn('[CIFI Optimizer] gave up: could not find the app (Pinia hunter store) after 60s'); }, 60000);
 })();

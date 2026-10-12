@@ -81,8 +81,8 @@ talent & attribute tables, then **Save as new build** or **Copy build code**.
 Test against **cifi-tools.com** directly — it receives updates (new talents, cap
 changes, build-code/param changes), so always verify there.
 
-1. Edit `cifi-optimizer-extension/optimizer.js` (bump the version in its startup
-   log line **and** `manifest.json`).
+1. Edit `cifi-optimizer-extension/optimizer.js` (bump `VERSION` at the top of the
+   file **and** the version in `manifest.json`).
 2. `chrome://extensions` → click **↻ reload** on the extension card.
 3. Reload **cifi-tools.com** and test there. The console prints the loaded version
    (`[CIFI Optimizer vX.Y.Z] …`) so you can confirm the reload took.
